@@ -28,6 +28,8 @@ import random
 import zlib
 import numpy as np
 
+from lib.encodings import *
+
 def hexdump(data):
     str = ""
     for d in data:
@@ -98,11 +100,6 @@ else:
 
 class VncServer():
 
-    class ENCODINGS:
-        raw     = 0
-        zlib    = 6     # zlib
-        cursor  = -239  # mouse cursor pseudo encoding
-    
     class CONFIG:
         _8bitdither = False
 
@@ -358,7 +355,7 @@ class VncServer():
         del screen
 
         self.primaryOrder = "rgb"
-        self.encoding = self.ENCODINGS.raw
+        self.encoding = enc.ENCODINGS.raw
         buttonmask = 0
         buttons =     [0, 0, 0, 0, 0, 0, 0, 0]
         left_pressed = 0
@@ -486,20 +483,21 @@ class VncServer():
                 data2 = sock.recv(3)
                 print("Client Message Type: SetEncoding (2)")
                 (nencodings,) = unpack("!xH", data2)
-                print("SetEncoding: total encodings ", repr(nencodings))
+                print("SetEncoding: total encodings", repr(nencodings))
                 data2 = sock.recv(4 * nencodings, socket.MSG_WAITALL)
-                print("len", len(data2))
+                #print("len", len(data2))
                 self.client_encodings = unpack("!%si" % nencodings, data2)
-                print("data", repr(self.client_encodings), len(self.client_encodings))
+                #print("data", repr(self.client_encodings), len(self.client_encodings))
 
-                if self.ENCODINGS.cursor in self.client_encodings:
+                if hasattr(enc.ENCODINGS, "cursor") and enc.ENCODINGS.cursor in self.client_encodings:
                     print("Remote cursor encoding present")
                     self.remotecursor = True
                     self.cursorchanged = True
-
-                if self.ENCODINGS.zlib in self.client_encodings:
+                
+                if hasattr(enc.ENCODINGS, "zlib") and enc.ENCODINGS.zlib in self.client_encodings:
                     print("Using zlib encoding")
-                    self.encoding = self.ENCODINGS.zlib
+                    self.encoding = enc.ENCODINGS.zlib
+
                 continue
 
 
@@ -735,7 +733,7 @@ class VncServer():
                 sendbuff.extend( image.tobytes() )
 
 
-            if self.encoding == self.ENCODINGS.zlib - 9998:
+            if hasattr(enc.ENCODINGS, "zlib") and self.encoding == enc.ENCODINGS.zlib - 9998:
                 if not firstUpdateSent:
                     firstUpdateSent = True
                     compress = zlib.compressobj(
@@ -767,42 +765,9 @@ class VncServer():
                 sendbuff.extend( l )        # send length
                 sendbuff.extend( zlibdata ) # send compressed data
                     
-            if self.encoding == self.ENCODINGS.zlib:
-                rectangles = 1
-                sendbuff.extend(pack("!BxH", 0, rectangles))
-                sendbuff.extend(pack("!HHHH", x, y, w, h))
-                sendbuff.extend(pack(">i", self.encoding))
-
-                print("Compressing...")
-
-
-                if not firstUpdateSent:
-                    firstUpdateSent = True
-                    zlibdata = zlib.compress( image.tobytes() )[2:]
-                    print("FIRSTTTTTTTTTTTTTTTTTTTTTTTTTT")
-                else:
-                    zlibdata = zlib.compress( image.tobytes() )[2:-4]
-
-                #zlibdata = zlib.compress( image.tobytes() )[2:-4] # no header and checksum
-                #zlibdata = zlib.compress( image.tobytes() )[:-4] # no checksum
-                #zlibdata = zlib.compress( image.tobytes() )
-
-                l = pack("!I", len(zlibdata) )
-                sendbuff.extend( l )        # send length
-                sendbuff.extend( zlibdata ) # send compressed data
-                #sendbuff.extend( pack("!B", 0) )
-
-                #inf = inflate(zlibdata, winsize=-15)
-
-                del zlibdata, l
             else:
                 # send with RAW encoding
-                rectangles = 1
-                sendbuff.extend(pack("!BxH", 0, rectangles))
-                sendbuff.extend(pack("!HHHH", x, y, w, h))
-                sendbuff.extend(pack(">i", self.encoding))
-                sendbuff.extend( image.tobytes() )
-
+                sendbuff.extend(enc.ENCODINGS.raw_send_image(x, y, w, h, image))
         else:
             print("[!] Unsupported BPP: %s" % self.bpp)
 
