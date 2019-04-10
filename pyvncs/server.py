@@ -29,6 +29,7 @@ import zlib
 import numpy as np
 
 from lib.encodings import *
+from lib import log
 
 def hexdump(data):
     str = ""
@@ -182,7 +183,7 @@ class VncServer():
 
 
     def __del__(self):
-        print("VncServer died")
+        log.debug("VncServer died")
 
     def encrypt(self, key, data):
         k = des(key, ECB, "\0\0\0\0\0\0\0\0", pad=None, padmode=PAD_PKCS5)
@@ -221,7 +222,7 @@ class VncServer():
             data = sock.recv(1024)
         except socket.timeout:
             data = None
-            print("getbuff() timeout")
+            log.debug("getbuff() timeout")
         
         return data
 
@@ -232,15 +233,15 @@ class VncServer():
         # RFB version handshake
         data = self.getbuff(30)
 
-        print("init received: '%s'" % data)
+        log.debug("init received: '%s'" % data)
         server_version = float(self.RFB_VERSION)
         try:
             client_version = float(data[4:11])
         except:
-            print("Error parsing client version")
+            log.debug("Error parsing client version")
             return False
 
-        print("client, server:", client_version, server_version)
+        log.debug("client, server:", client_version, server_version)
 
         # security types handshake
         sendbuff = pack("B", len(self.sectypes))    # number of security types
@@ -254,13 +255,13 @@ class VncServer():
             sectype = None
         
         if sectype not in self.sectypes:
-            print("Incompatible security type: %s" % data)
+            log.debug("Incompatible security type: %s" % data)
             sock.send(pack("B", 1)) # failed handshake
             self.sendmessage("Incompatible security type")
             sock.close()
             return False
 
-        print("sec type data: %s" % data)
+        log.debug("sec type data: %s" % data)
 
         # VNC Auth
         if sectype == 2:
@@ -278,9 +279,9 @@ class VncServer():
             if data == crypted:
                 # Handshake successful
                 sock.send(pack("I", 0))
-                print("Auth OK")
+                log.debug("Auth OK")
             else:
-                print("Invalid auth")
+                log.debug("Invalid auth")
                 return False
 
         #unsupported VNC auth type
@@ -289,7 +290,7 @@ class VncServer():
 
         # get ClientInit
         data = self.getbuff(30)
-        print("Clientinit (shared flag)", repr(data))
+        log.debug("Clientinit (shared flag)", repr(data))
 
         self.ServerInit()
 
@@ -300,9 +301,9 @@ class VncServer():
 
         sock = self.socket
         screen = ImageGrab.grab()
-        print("screen", repr(screen))
+        log.debug("screen", repr(screen))
         size = screen.size
-        print("size", repr(size))
+        log.debug("size", repr(size))
         del screen
         
         width = size[0]
@@ -339,8 +340,8 @@ class VncServer():
         sendbuff += pack("!I", desktop_name_len)
         sendbuff += desktop_name.encode()
 
-        print("width", repr(width))
-        print("height", repr(height))
+        log.debug("width", repr(width))
+        log.debug("height", repr(height))
 
         sock.send(sendbuff)
 
@@ -437,7 +438,7 @@ class VncServer():
             kbdmap[0xffe2] = keyboard.Key.shift
             
         while True:
-            #print(".", end='', flush=True)
+            #log.debug(".", end='', flush=True)
             r,_,_ = select.select([self.socket],[],[],0)
             if r == []:
                 #no data
@@ -448,10 +449,10 @@ class VncServer():
             try:
                 data = sock.recv(1) # read first byte
             except socket.timeout:
-                #print("timeout")
+                #log.debug("timeout")
                 continue
             except Exception as e:
-                print("exception '%s'" % e)
+                log.debug("exception '%s'" % e)
                 sock.close()
                 break
 
@@ -462,40 +463,40 @@ class VncServer():
 
             if data[0] == 0: # client SetPixelFormat
                 data2 = sock.recv(19, socket.MSG_WAITALL)
-                print("Client Message Type: Set Pixel Format (0)")
+                log.debug("Client Message Type: Set Pixel Format (0)")
                 (self.bpp, self.depth, self.bigendian, self.truecolor, self.red_maximum,
                  self.green_maximum, self.blue_maximum,
                  self.red_shift, self.green_shift, self.blue_shift
                  ) = unpack("!xxxBBBBHHHBBBxxx", data2)
-                print("IMG bpp, depth, endian, truecolor", self.bpp, self.depth, self.bigendian, self.truecolor)
-                print("SHIFTS", self.red_shift, self.green_shift, self.blue_shift)
-                print("MAXS", self.red_maximum, self.green_maximum, self.blue_maximum)
+                log.debug("IMG bpp, depth, endian, truecolor", self.bpp, self.depth, self.bigendian, self.truecolor)
+                log.debug("SHIFTS", self.red_shift, self.green_shift, self.blue_shift)
+                log.debug("MAXS", self.red_maximum, self.green_maximum, self.blue_maximum)
 
                 if self.red_shift > self.blue_shift:
                     self.primaryOrder = "rgb"
                 else:
                     self.primaryOrder = "bgr"
-                print("Using order: ", self.primaryOrder)
+                log.debug("Using order: ", self.primaryOrder)
 
                 continue
             
             if data[0] == 2: # SetEncoding
                 data2 = sock.recv(3)
-                print("Client Message Type: SetEncoding (2)")
+                log.debug("Client Message Type: SetEncoding (2)")
                 (nencodings,) = unpack("!xH", data2)
-                print("SetEncoding: total encodings", repr(nencodings))
+                log.debug("SetEncoding: total encodings", repr(nencodings))
                 data2 = sock.recv(4 * nencodings, socket.MSG_WAITALL)
-                #print("len", len(data2))
+                #log.debug("len", len(data2))
                 self.client_encodings = unpack("!%si" % nencodings, data2)
-                #print("data", repr(self.client_encodings), len(self.client_encodings))
+                #log.debug("data", repr(self.client_encodings), len(self.client_encodings))
 
                 if hasattr(enc.ENCODINGS, "cursor") and enc.ENCODINGS.cursor in self.client_encodings:
-                    print("Remote cursor encoding present")
+                    log.debug("Remote cursor encoding present")
                     self.remotecursor = True
                     self.cursorchanged = True
                 
                 if hasattr(enc.ENCODINGS, "zlib") and enc.ENCODINGS.zlib in self.client_encodings:
-                    print("Using zlib encoding")
+                    log.debug("Using zlib encoding")
                     self.encoding = enc.ENCODINGS.zlib
 
                 continue
@@ -503,10 +504,10 @@ class VncServer():
 
             if data[0] == 3: # FBUpdateRequest
                 data2 = sock.recv(9, socket.MSG_WAITALL)
-                #print("Client Message Type: FBUpdateRequest (3)")
+                #log.debug("Client Message Type: FBUpdateRequest (3)")
                 #print(len(data2))
                 (incremental, x, y, w, h) = unpack("!BHHHH", data2)
-                #print("RFBU:", incremental, x, y, w, h)
+                #log.debug("RFBU:", incremental, x, y, w, h)
                 self.SendRectangles(sock, x, y, w, h, incremental)
 
                 if self.remotecursor and self.cursorchanged:
@@ -519,7 +520,7 @@ class VncServer():
                 data2 = sock.recv(7)
                 # B = U8, L = U32
                 (downflag, key) = unpack("!BxxL", data2)
-                print("KeyEvent", downflag, hex(key))
+                log.debug("KeyEvent", downflag, hex(key))
                 
                 # special key
                 if key in kbdmap:
@@ -531,9 +532,9 @@ class VncServer():
                         kbdkey = None
 
                 try:
-                    print("KEY:", kbdkey)
+                    log.debug("KEY:", kbdkey)
                 except:
-                    print("KEY: (unprintable)")
+                    log.debug("KEY: (unprintable)")
 
                 try:
                     if downflag:
@@ -541,7 +542,7 @@ class VncServer():
                     else:
                         keyboard.Controller().release(kbdkey)
                 except:
-                    print("Error sending key")
+                    log.debug("Error sending key")
 
                 continue
 
@@ -557,46 +558,46 @@ class VncServer():
                 mouse.Controller().position = (x, y)
 
                 if buttons[0] and not left_pressed:
-                    print("LEFT PRESSED")
+                    log.debug("LEFT PRESSED")
                     mouse.Controller().press(mouse.Button.left)
                     left_pressed = 1
                 elif not buttons[0] and left_pressed:
-                    print("LEFT RELEASED")
+                    log.debug("LEFT RELEASED")
                     mouse.Controller().release(mouse.Button.left)
                     left_pressed = 0
 
                 if buttons[1] and not middle_pressed:
-                    print("MIDDLE PRESSED")
+                    log.debug("MIDDLE PRESSED")
                     mouse.Controller().press(mouse.Button.middle)
                     middle_pressed = 1
                 elif not buttons[1] and middle_pressed:
-                    print("MIDDLE RELEASED")
+                    log.debug("MIDDLE RELEASED")
                     mouse.Controller().release(mouse.Button.middle)
                     middle_pressed = 0
 
                 if buttons[2] and not right_pressed:
-                    print("RIGHT PRESSED")
+                    log.debug("RIGHT PRESSED")
                     mouse.Controller().press(mouse.Button.right)
                     right_pressed = 1
                 elif not buttons[2] and right_pressed:
-                    print("RIGHT RELEASED")
+                    log.debug("RIGHT RELEASED")
                     mouse.Controller().release(mouse.Button.right)
                     right_pressed = 0
 
                 if buttons[3]:
-                    print("SCROLLUP PRESSED")
+                    log.debug("SCROLLUP PRESSED")
                     mouse.Controller().scroll(0, 2)
 
                 if buttons[4]:
-                    print("SCROLLDOWN PRESSED")
+                    log.debug("SCROLLDOWN PRESSED")
                     mouse.Controller().scroll(0, -2)
                 
-                #print("PointerEvent", buttonmask, x, y)
+                #log.debug("PointerEvent", buttonmask, x, y)
                 continue
 
             else:
                 data2 = sock.recv(4096)
-                print("RAW Server received data:", repr(data[0]) , data+data2)
+                log.debug("RAW Server received data:", repr(data[0]) , data+data2)
             
 
     def GetRectangle(self, x, y, w, h):
@@ -621,7 +622,7 @@ class VncServer():
     def SendRectangles(self, sock, x, y, w, h, incremental=0):
         # send FramebufferUpdate to client
 
-        #print("start SendRectangles")
+        #log.debug("start SendRectangles")
         rectangle = self.GetRectangle(x, y, w, h)
         if not rectangle:
             rectangle = Image.new("RGB", [w, h], (0,0,0))
@@ -650,7 +651,7 @@ class VncServer():
                     (x, y, _, _) = diff.getbbox()
                     w = rectangle.width
                     h = rectangle.height
-                    #print("XYWH:", x,y,w,h, "diff", repr(diff.getbbox()))
+                    #log.debug("XYWH:", x,y,w,h, "diff", repr(diff.getbbox()))
 
         stimeout = sock.gettimeout()
         sock.settimeout(None)
@@ -677,7 +678,7 @@ class VncServer():
             #redMask = ((1 << redBits) - 1) << self.red_shift
             #greenMask = ((1 << greenBits) - 1) << self.green_shift
             #blueMask = ((1 << blueBits) - 1) << self.blue_shift
-            #print("redMask", redMask, greenMask, blueMask)
+            #log.debug("redMask", redMask, greenMask, blueMask)
 
             if self.primaryOrder == "bgr":
                 self.blue_shift = 0
@@ -757,7 +758,7 @@ class VncServer():
                 sendbuff.extend(pack("!HHHH", x, y, w, h))
                 sendbuff.extend(pack(">i", self.encoding))
 
-                print("Compressing...")
+                log.debug("Compressing...")
                 zlibdata = compress.compress( image.tobytes() )
                 zlibdata += compress.flush()
                 l = pack("!I", len(zlibdata) )
@@ -769,7 +770,7 @@ class VncServer():
                 # send with RAW encoding
                 sendbuff.extend(enc.ENCODINGS.raw_send_image(x, y, w, h, image))
         else:
-            print("[!] Unsupported BPP: %s" % self.bpp)
+            log.debug("[!] Unsupported BPP: %s" % self.bpp)
 
         self.framebuffer = lastshot
         try:
@@ -778,4 +779,4 @@ class VncServer():
             # connection closed?
             return False
         sock.settimeout(stimeout)
-        #print("end SendRectangles")
+        #log.debug("end SendRectangles")

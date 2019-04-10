@@ -1,2 +1,4 @@
-pyuserinput
+pydes
+pynput
+numpy
 

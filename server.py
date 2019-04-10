@@ -5,9 +5,19 @@ import pyvncs
 from argparse import ArgumentParser
 from threading import Thread
 from time import sleep
-
 import sys
 import socket
+import signal
+from lib import log
+
+#_debug = log.debug
+_debug = print
+
+def signal_handler(signal, frame):
+    _debug("Exiting on %s signal..." % signal)
+    sys.exit(0)
+
+signal.signal(signal.SIGINT, signal_handler)
 
 
 class ControlThread(Thread):
@@ -22,7 +32,7 @@ class ControlThread(Thread):
             sleep(1)
             for t in threads:
                 if not t.isAlive():
-                    print("ControlThread removing dead", t)
+                    _debug("ControlThread removing dead", t)
                     threads.remove(t)
 
 class ClientThread(Thread):
@@ -34,17 +44,17 @@ class ClientThread(Thread):
         self.setDaemon(True)
 
     def __del__(self):
-        print("ClientThread died")
+        _debug("ClientThread died")
 
     def run(self):
-        print("[+] New server socket thread started for " + self.ip + ":" + str(self.port))
-        #print("Thread", self)
+        _debug("[+] New server socket thread started for " + self.ip + ":" + str(self.port))
+        #_debug("Thread", self)
         server = pyvncs.server.VncServer(self.sock, VNC_PASSWORD)
         server.CONFIG._8bitdither = CONFIG._8bitdither
         status = server.init()
 
         if not status:
-            print("Error negotiating client init")
+            _debug("Error negotiating client init")
             return False
         server.protocol()
 
@@ -61,11 +71,17 @@ def main(argv):
                         help="Listen in this port, default: %s" % ("5901"), type=int, required=False, default='5901')
     parser.add_argument("-P", "--password", help="Sets password", required=True, dest="VNC_PASSWORD")
     parser.add_argument("-8", "--8bitdither", help="Enable 8 bit dithering", required=False, action='store_true', dest="dither")
+    parser.add_argument("-O", "--output-file", help="Redirects all debug output to file", required=False, dest="OUTFILE")
+
     args = parser.parse_args()
-       
+
+    if args.OUTFILE is not None:
+        fsock = open(args.OUTFILE, 'w')
+        sys.stdout = sys.stderr = fsock
+
     # Multithreaded Python server
     TCP_IP = '0.0.0.0' if not hasattr(args,"TCP_IP") else args.TCP_IP
-    TCP_PORT = '0.0.0.0' if not hasattr(args,"TCP_PORT") else args.TCP_PORT
+    TCP_PORT = '5901' if not hasattr(args,"TCP_PORT") else args.TCP_PORT
     VNC_PASSWORD = args.VNC_PASSWORD
     CONFIG._8bitdither = args.dither
 
@@ -77,8 +93,8 @@ def main(argv):
     controlthread.start()
     threads.append(controlthread)
 
-    print("Multithreaded Python server : Waiting for connections from TCP clients...")
-    print("Runing on:", sys.platform)
+    _debug("Multithreaded Python server : Waiting for connections from TCP clients...")
+    _debug("Runing on:", sys.platform)
     while True:
         sockServer.listen(4)
         (conn, (ip,port)) = sockServer.accept()
@@ -95,8 +111,8 @@ if __name__ == "__main__":
         main(sys.argv)
     except KeyboardInterrupt:
         # quit
-        print("Exiting on ctrl+c...")
+        _debug("Exiting on ctrl+c...")
         #for t in threads:
-        #    print("Killing", t)
+        #    _debug("Killing", t)
         sys.exit()
  
