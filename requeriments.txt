@@ -1,2 +1,5 @@
-pyuserinput
-
+pydes
+pynput
+numpy
+Pillow-PIL
+elevate

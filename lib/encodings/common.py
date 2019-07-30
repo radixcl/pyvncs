@@ -15,8 +15,15 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program. If not, see <http://www.gnu.org/licenses/>.
 
-# at least, raw encoding is needed by the rfb protocol    
-from . import common
-from . import raw
-from . import zlib
-from . import cursor
+encodings = {}
+
+class ENCODINGS:
+    raw = 0
+    zlib = 6
+    # supported pseudo-encodings
+    cursor = -239
+
+encodings_priority = [
+    ENCODINGS.zlib,
+    ENCODINGS.raw
+]

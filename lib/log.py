@@ -15,8 +15,14 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program. If not, see <http://www.gnu.org/licenses/>.
 
-# at least, raw encoding is needed by the rfb protocol    
-from . import common
-from . import raw
-from . import zlib
-from . import cursor
+import logging
+logging.basicConfig(level=logging.DEBUG, format='[%(threadName)s] %(message)s')
+logger = logging.getLogger('pyvncs')
+
+
+def debug(*args):
+    str = ""
+    for s in args:
+        str = "%s %s" % (str, s)
+    str = str.strip()
+    logger.debug(str)

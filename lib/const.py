@@ -15,8 +15,15 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program. If not, see <http://www.gnu.org/licenses/>.
 
-# at least, raw encoding is needed by the rfb protocol    
-from . import common
-from . import raw
-from . import zlib
-from . import cursor
+import sys
+
+# constants workaround
+class _const:
+    class ConstError(TypeError): pass
+    def __setattr__(self, name, value):
+        if name in self.__dict__.keys():
+            raise (self.ConstError, "Can't rebind const(%s)" % name)
+        self.__dict__[name]=value
+
+sys.modules[__name__]=_const()
+
