@@ -10,8 +10,8 @@ import socket
 import signal
 from lib import log
 
-#_debug = log.debug
-_debug = print
+_debug = log.debug
+#_debug = print
 
 def signal_handler(signal, frame):
     _debug("Exiting on %s signal..." % signal)
@@ -95,6 +95,19 @@ def main(argv):
 
     _debug("Multithreaded Python server : Waiting for connections from TCP clients...")
     _debug("Runing on:", sys.platform)
+    if sys.platform in ['win32', 'win64']:
+        from lib.oshelpers import windows as win32
+        if not win32.is_admin():
+            ret = win32.run_as_admin()
+            if ret is None:
+                log.debug("Respawning with admin rights")
+                sys.exit(0)
+            elif ret is True:
+                # admin rights
+                log.debug("Running with admin rights!")
+            else:
+                print('Error(ret=%d): cannot elevate privilege.' % (ret))
+                sys.exit(1)
     while True:
         sockServer.listen(4)
         (conn, (ip,port)) = sockServer.accept()

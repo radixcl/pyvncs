@@ -16,5 +16,21 @@
 # along with this program. If not, see <http://www.gnu.org/licenses/>.
 
 from . import common
+from struct import *
+from lib import log
+import zlib
 
-common.ENCODINGS.cursor = -239
+class Encoding:
+    name = 'Cursor'
+    id = -239
+    description = 'Cursor pseudo encoding'
+    enabled = True
+    pseudoEncoding = True
+
+    cursor_sent = False
+
+    def __init__(self):
+        log.debug("Initialized", __name__)
+
+common.encodings[common.ENCODINGS.cursor] = Encoding
+log.debug("Loaded encoding: %s (%s)" % (__name__, Encoding.id))

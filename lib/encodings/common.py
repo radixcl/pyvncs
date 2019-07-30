@@ -15,5 +15,15 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program. If not, see <http://www.gnu.org/licenses/>.
 
+encodings = {}
+
 class ENCODINGS:
-    pass
+    raw = 0
+    zlib = 6
+    # supported pseudo-encodings
+    cursor = -239
+
+encodings_priority = [
+    ENCODINGS.zlib,
+    ENCODINGS.raw
+]

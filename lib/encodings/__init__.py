@@ -16,5 +16,7 @@
 # along with this program. If not, see <http://www.gnu.org/licenses/>.
 
 # at least, raw encoding is needed by the rfb protocol    
-from . import common as enc
+from . import common
 from . import raw
+from . import zlib
+from . import cursor

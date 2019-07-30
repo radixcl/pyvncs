@@ -17,16 +17,30 @@
 
 from . import common
 from struct import *
+from lib import log
 
-def send_image(x, y, w, h, image):
-    _buff = bytearray()
-    rectangles = 1
-    _buff.extend(pack("!BxH", 0, rectangles))
-    _buff.extend(pack("!HHHH", x, y, w, h))
-    _buff.extend(pack(">i", common.ENCODINGS.raw))
-    _buff.extend( image.tobytes() )
+class Encoding:
+    _buff = None
 
-    return _buff
+    name = 'raw'
+    id = 0
+    description = 'Raw VNC encoding'
+    enabled = True
+    firstUpdateSent = False
 
-common.ENCODINGS.raw = 0
-common.ENCODINGS.raw_send_image = send_image
+    def __init__(self):
+        log.debug("Initialized", __name__)
+
+    def send_image(self, x, y, w, h, image):
+        self._buff = bytearray()
+        rectangles = 1
+        self._buff.extend(pack("!BxH", 0, rectangles))  # message type 0 == FramebufferUpdate
+        self._buff.extend(pack("!HHHH", x, y, w, h))
+        self._buff.extend(pack(">i", self.id))
+        self._buff.extend( image.tobytes() )
+
+        return self._buff
+
+common.encodings[common.ENCODINGS.raw] = Encoding
+
+log.debug("Loaded encoding: %s (%s)" % (__name__, Encoding.id))
