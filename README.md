@@ -13,11 +13,14 @@ Supported encodings:
 - raw
 - zlib
 
-TODO:
+## TODO:
 - Add support for more (efficient) encodings
 - VEnCrypt support (WIP)
 - Add support for uPnP (for incomming connections on supported nat gateways)
 
-FAQ:
+## FAQ:
+
 Q: Why a VNC server on python?
+
 A: Because python is fun!
+
