@@ -30,86 +30,44 @@ import numpy as np
 
 from lib import mousectrl
 from lib import kbdctrl
+from lib import clipboardctrl
 from lib.imagegrab import ImageGrab
+from lib.rfb_bitmap import RfbBitmap
 from lib import log
-from lib import bgr233_palette
 
 # encodings support
 import lib.encodings as encs
 from lib.encodings.common import ENCODINGS
 
-def hexdump(data):
-    str = ""
-    for d in data:
-        str += hex(d)
-        str += "(%s) " % d
-    return str
-
-def quantizetopalette(silf, palette, dither=False):
-    """Converts an RGB or L mode image to use a given P image's palette."""
-
-    silf.load()
-
-    # use palette from reference image
-    palette.load()
-    if palette.mode != "P":
-        raise ValueError("bad mode for palette image")
-    if silf.mode != "RGB" and silf.mode != "L":
-        raise ValueError(
-            "only RGB or L mode images can be quantized to a palette"
-            )
-    im = silf.im.convert("P", 1 if dither else 0, palette.im)
-    # the 0 above means turn OFF dithering
-
-    # Later versions of Pillow (4.x) rename _makeself to _new
-    try:
-        return silf._new(im)
-    except AttributeError:
-        return silf._makeself(im)
+# auth support
+from lib.auth.vnc_auth import VNCAuth
+from lib.auth.vencrypt import VeNCrypt
 
 class VncServer():
 
-    class CONFIG:
-        _8bitdither = False
+    class RFB_SECTYPES:
+        vncauth = 2     # plain VNC auth
+        vencrypt = 19   # VeNCrypt
+        unix = 129      # Unix Login Authentication
 
     encoding_object = None
 
-    def __init__(self, socket, password):
+    def __init__(self, socket, password=None, auth_type=None, pem_file='', vnc_config = None):
         self.RFB_VERSION = '003.008'
-        self.RFB_SECTYPES = [
-                             2,  # VNC auth
-                             19  # VeNCrypt
-                            ]
         self.initmsg = ("RFB %s\n" % self.RFB_VERSION)
         self.socket = socket
         self.framebuffer = None
         self.password = password
-        self.sectypes = self.RFB_SECTYPES
         self.cursor_support = False
-        
+        self.auth_type = auth_type
+        self.pem_file = pem_file
+        self.vnc_config = vnc_config
+
+        log.debug("Configured auth type:", self.auth_type)
+
+
     def __del__(self):
         log.debug("VncServer died")
-
-    def encrypt(self, key, data):
-        k = des(key, ECB, "\0\0\0\0\0\0\0\0", pad=None, padmode=PAD_PKCS5)
-        d = k.encrypt(data)
-        return d
-
-    def decrypt(self, challenge, data):
-        k = des(challenge, ECB, "\0\0\0\0\0\0\0\0", pad=None, padmode=PAD_PKCS5)
-        return k.decrypt(data)
-
-    def mirrorBits(self, key):
-        newkey = []
-        for ki in range(len(key)):
-            bsrc = key[ki]
-            btgt = 0
-            for i in range(8):
-                if ord(bsrc) & (1 << i):
-                    btgt = btgt | (1 << 7-i)
-            newkey.append(btgt)
-        
-        return newkey
 
     def sendmessage(self, message):
         ''' sends a RFB message, usually an error message '''
@@ -117,7 +75,7 @@ class VncServer():
         message = bytes(message, 'iso8859-1')
         # 4 bytes lenght and string
         buff = pack("I%ds" % (len(message),), len(message), message)
-        sock.send(message)
+        sock.send(buff)
     
     def getbuff(self, timeout):
         sock = self.socket
@@ -149,17 +107,27 @@ class VncServer():
         log.debug("client, server:", client_version, server_version)
 
         # security types handshake
-        sendbuff = pack("B", len(self.sectypes))    # number of security types
-        sendbuff += pack('%sB' % len(self.sectypes), *self.sectypes)   # send available sec types
+        # sectypes = [
+        #     self.RFB_SECTYPES.vncauth,
+        #     self.RFB_SECTYPES.vencrypt
+        #     ]
+
+        sectypes = [
+            self.auth_type
+        ]
+        log.debug('sectypes', sectypes)
+        sendbuff = pack("B", len(sectypes))    # number of security types
+        sendbuff += pack('%sB' % len(sectypes), *sectypes)   # send available sec types
         sock.send(sendbuff)
 
+        # get client choosen security type
         data = self.getbuff(30)
         try:
             sectype = unpack("B", data)[0]
         except:
             sectype = None
         
-        if sectype not in self.sectypes:
+        if sectype not in sectypes:
             log.debug("Incompatible security type: %s" % data)
             sock.send(pack("B", 1)) # failed handshake
             self.sendmessage("Incompatible security type")
@@ -169,28 +137,57 @@ class VncServer():
         log.debug("sec type data: %s" % data)
 
         # VNC Auth
-        if sectype == 2:
-            # el cliente encripta el challenge con la contraseña ingresada como key
-            pw = (self.password + '\0' * 8)[:8]
-            challenge = os.urandom(16)  # challenge
-            sock.send(challenge)    # send challenge
-            # obtener desde el cliente el dato encritado
-            data = self.getbuff(30)
-            # la encriptacion de challenge, con pw como key debe dar data
-            
-            k = des(self.mirrorBits(pw))
-            crypted = k.encrypt(challenge)
-
-            if data == crypted:
-                # Handshake successful
-                sock.send(pack("I", 0))
-                log.debug("Auth OK")
-            else:
-                log.debug("Invalid auth")
+        if sectype == self.RFB_SECTYPES.vncauth:
+            auth = VNCAuth()
+            auth.getbuff = self.getbuff
+            if not auth.auth(sock, self.password):
+                msg = "Auth failed."
+                sendbuff = pack("I", len(msg))
+                sendbuff += msg.encode()
+                sock.send(sendbuff)
+                sock.close()
                 return False
+
+        # VeNCrypt
+        elif sectype == self.RFB_SECTYPES.vencrypt:
+            userlist = {}
+            try:
+                userlist[self.password.split(':')[0]] = self.password.split(':')[1]
+            except Exception as ex:
+                log.debug("Unable to parse username:password combination.\n%s" % ex)
+                sock.close()
+                return False
+
+            auth = VeNCrypt(sock)
+            auth.getbuff = self.getbuff
+            auth.send_subtypes()
+            client_subtype = auth.client_subtype
+
+            if client_subtype == 256: # Vencrypt Plain auth
+                if not auth.auth_plain(userlist):
+                    sock.close()
+                    return False
+
+            if client_subtype == 259: # Vencrypt TLSPlain auth
+                auth.pem_file = self.pem_file
+                auth.socket = self.socket
+                if not auth.auth_tls_plain(userlist):
+                    sock.close()
+                    return False
+
+            else:
+                # unsupported subtype
+                log.debug("Unsuported client_subtype", client_subtype)
+                sock.close()
+                return False
+        
+        #elif sectype == self.RFB_SECTYPES.unix:
+        #    log.debug("UNIX!!")
 
         #unsupported VNC auth type
         else:
+            log.debug("Unsupported auth type")
+            sock.close()
             return False
 
         # get ClientInit
@@ -216,7 +213,7 @@ class VncServer():
         height = size[1]
         self.height = height
         bpp = 32    # FIXME: get real bpp
-        depth = 32  # FIXME: get real depth
+        depth = 24  # FIXME: get real depth
         self.depth = depth
         self.bpp = bpp
         bigendian = 0
@@ -233,13 +230,14 @@ class VncServer():
         self.green_shift = green_shift
         blue_shift = 0
         self.blue_shift = blue_shift
+        self.rfb_bitmap = RfbBitmap()
 
         sendbuff =  pack("!HH", width, height)
         sendbuff += pack("!BBBB", bpp, depth, bigendian, truecolor)
         sendbuff += pack("!HHHBBB", red_maximum, green_maximum, blue_maximum, red_shift, green_shift, blue_shift)
         sendbuff += pack("!xxx") # padding
 
-        desktop_name = "Test VNC"
+        desktop_name = self.vnc_config.win_title
         desktop_name_len = len(desktop_name)
 
         sendbuff += pack("!I", desktop_name_len)
@@ -261,6 +259,7 @@ class VncServer():
         
         mousecontroller = mousectrl.MouseController()
         kbdcontroller = kbdctrl.KeyboardController()
+        clipboardcontroller = clipboardctrl.ClipboardController()
 
         self.primaryOrder = "rgb"
         self.encoding = ENCODINGS.raw
@@ -357,6 +356,10 @@ class VncServer():
             if data[0] == 5:    # PointerEvent
                 mousecontroller.process_event(sock.recv(5, socket.MSG_WAITALL))
                 continue
+            
+            if data[0] == 6:    # ClientCutText
+                text = clipboardcontroller.client_cut_text(sock)
+                log.debug("ClientCutText:", text)
 
             else:
                 data2 = sock.recv(4096)
@@ -421,66 +424,17 @@ class VncServer():
         sock.settimeout(None)
 
         if self.bpp == 32 or self.bpp == 16 or self.bpp == 8:
+            bitmap = self.rfb_bitmap
+            bitmap.bpp = self.bpp
+            bitmap.depth = self.depth
+            bitmap.dither = self.vnc_config.eightbitdither
+            bitmap.primaryOrder = self.primaryOrder
+            bitmap.truecolor = self.truecolor
+            bitmap.red_shift = self.red_shift
+            bitmap.green_shift = self.green_shift
+            bitmap.blue_shift = self.blue_shift
 
-            if self.bpp == 32:
-                redBits = 8 
-                greenBits = 8 
-                blueBits = 8
-
-                # image array
-                a = np.asarray(rectangle).copy()
- 
-                if self.primaryOrder == "bgr":  # bit shifting
-                    blueMask = (1 << blueBits) - 1
-                    greenMask = ((1 << greenBits) - 1) << self.green_shift
-                    redMask = ((1 << redBits) - 1) << self.red_shift
-
-                    a[..., 0] = ( a[..., 0] ) & blueMask >> self.blue_shift
-                    a[..., 1] = ( a[..., 1] ) & greenMask >> self.green_shift
-                    a[..., 2] = ( a[..., 2] ) & redMask >> self.red_shift
-                
-                else:   # RGB
-                    redMask = ((1 << redBits) - 1) << self.red_shift
-                    greenMask = ((1 << greenBits) - 1) << self.green_shift
-                    blueMask = ((1 << blueBits) - 1) << self.blue_shift
-                    a[..., 0] = ( a[..., 0] ) & redMask >> self.red_shift
-                    a[..., 1] = ( a[..., 1] ) & greenMask >> self.green_shift
-                    a[..., 2] = ( a[..., 2] ) & blueMask >> self.blue_shift
-
-                image = Image.fromarray(a)
-                if self.primaryOrder == "rgb":
-                    (b, g, r) = image.split()
-                    image = Image.merge("RGB", (r, g, b))
-                    del b,g,r
-                image = image.convert("RGBX")
-
-            if self.bpp == 16:  #BGR565
-                greenBits = 5
-                blueBits = 6
-                redBits = 5
-
-                image = rectangle
-                if self.depth == 16:
-                    image = image.convert('BGR;16')
-                if self.depth == 15:
-                    image = image.convert('BGR;15')
-
-            elif self.bpp == 8: #bgr233
-                redBits = 3
-                greenBits = 3
-                blueBits = 2
-
-                image = rectangle
-
-                p = Image.new('P',(16,16))
-                p.putpalette(bgr233_palette.palette)
-
-                image = quantizetopalette(image, p, dither=self.CONFIG._8bitdither)
-
-                #image = image.convert('RGB', colors=4).quantize(palette=p)
-                #log.debug(image)
-
-
+            image = bitmap.get_bitmap(rectangle)
 
             # send image with client defined encoding
             sendbuff.extend(self.encoding_object.send_image(x, y, w, h, image))

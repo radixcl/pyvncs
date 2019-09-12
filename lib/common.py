@@ -66,3 +66,9 @@ class proc:
     def waitproc(self):
         while psutil.pid_exists(self.pid):
             time.sleep(.25)
+
+def reshape(a, cols):
+    
+    for i in range(0, int(len(a)/cols), cols):
+        print(i)
+        print(a[i:i+cols])

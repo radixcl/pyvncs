@@ -15,14 +15,41 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program. If not, see <http://www.gnu.org/licenses/>.
 
+import inspect
 import logging
-logging.basicConfig(level=logging.DEBUG, format='[%(threadName)s] %(message)s')
+
+
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s: %(message)s')
 logger = logging.getLogger('pyvncs')
 
+def _log(*args, logtype='debug'):
 
-def debug(*args):
-    str = ""
+    func = inspect.stack()[2][3]
+    if func[0] != '<':
+        func = "%s():" % func
+
+    _str = func
+    
     for s in args:
-        str = "%s %s" % (str, s)
-    str = str.strip()
-    logger.debug(str)
+        _str = "%s %s" % (_str, s)
+    _str = _str.strip()
+    f = getattr(logger, logtype)
+    #logger.debug(str)
+    f(_str)
+
+def __getattr__(name):
+
+    def method(*args):
+        _str = ''
+        if args:
+            for s in args:
+                _str = "%s %s" % (_str, s)
+            _str = _str.strip()
+
+        _log(_str, logtype=name)
+
+    return method
+
+
+
+
