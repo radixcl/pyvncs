@@ -8,6 +8,7 @@ if sys.platform == "linux" or sys.platform == "linux2":
     # take screen images, that's not the best way, so here
     # we use directly use xlib to take the screenshot.
     class ImageGrab():
+        @staticmethod
         def grab():
             dsp = display.Display()
             root = dsp.screen().root
@@ -22,6 +23,7 @@ elif sys.platform == "darwin":
     log.debug("ImageGrab: running on darwin")
     import Quartz.CoreGraphics as CG
     class ImageGrab():
+        @staticmethod
         def grab():
             screenshot = CG.CGWindowListCreateImage(CG.CGRectInfinite, CG.kCGWindowListOptionOnScreenOnly, CG.kCGNullWindowID, CG.kCGWindowImageDefault)
             width = CG.CGImageGetWidth(screenshot)

@@ -217,7 +217,7 @@ class VncServer():
         self.depth = depth
         self.bpp = bpp
         bigendian = 0
-        truecolor = 1
+        self.truecolor = 1
         red_maximum = 255
         self.red_maximum = red_maximum
         green_maximum = 255
@@ -233,7 +233,7 @@ class VncServer():
         self.rfb_bitmap = RfbBitmap()
 
         sendbuff =  pack("!HH", width, height)
-        sendbuff += pack("!BBBB", bpp, depth, bigendian, truecolor)
+        sendbuff += pack("!BBBB", bpp, depth, bigendian, self.truecolor)
         sendbuff += pack("!HHHBBB", red_maximum, green_maximum, blue_maximum, red_shift, green_shift, blue_shift)
         sendbuff += pack("!xxx") # padding
 
