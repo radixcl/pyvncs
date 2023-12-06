@@ -1,5 +1,5 @@
 pydes
 pynput
-numpy==1.17
+numpy
 Pillow-PIL
 elevate

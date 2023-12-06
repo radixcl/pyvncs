@@ -22,11 +22,9 @@ from pynput import mouse, keyboard
 from PIL import Image, ImageChops, ImageDraw, ImagePalette
 
 import socket
-import select
-import os
-import sys
-import random
+import errno
 import numpy as np
+import time
 
 from lib import mousectrl
 from lib import kbdctrl
@@ -38,12 +36,13 @@ from lib import log
 # encodings support
 import lib.encodings as encs
 from lib.encodings.common import ENCODINGS
+from lib.encodings.cursor import Encoding as CursorEncoding
 
 # auth support
 from lib.auth.vnc_auth import VNCAuth
 from lib.auth.vencrypt import VeNCrypt
 
-class VncServer():
+class VNCServer():
 
     class RFB_SECTYPES:
         vncauth = 2     # plain VNC auth
@@ -51,6 +50,8 @@ class VncServer():
         unix = 129      # Unix Login Authentication
 
     encoding_object = None
+
+    last_cursor = None
 
     def __init__(self, socket, password=None, auth_type=None, pem_file='', vnc_config = None):
         self.RFB_VERSION = '003.008'
@@ -62,6 +63,7 @@ class VncServer():
         self.auth_type = auth_type
         self.pem_file = pem_file
         self.vnc_config = vnc_config
+        self.cursor_encoding = CursorEncoding()
 
         log.debug("Configured auth type:", self.auth_type)
 
@@ -69,7 +71,7 @@ class VncServer():
     def __del__(self):
         log.debug("VncServer died")
 
-    def sendmessage(self, message):
+    def send_message(self, message):
         ''' sends a RFB message, usually an error message '''
         sock = self.socket
         message = bytes(message, 'iso8859-1')
@@ -77,7 +79,7 @@ class VncServer():
         buff = pack("I%ds" % (len(message),), len(message), message)
         sock.send(buff)
     
-    def getbuff(self, timeout):
+    def get_buffer(self, timeout):
         sock = self.socket
         sock.settimeout(timeout)
 
@@ -94,7 +96,7 @@ class VncServer():
         sock.send(self.initmsg.encode())
 
         # RFB version handshake
-        data = self.getbuff(30)
+        data = self.get_buffer(30)
 
         log.debug("init received: '%s'" % data)
         server_version = float(self.RFB_VERSION)
@@ -121,7 +123,7 @@ class VncServer():
         sock.send(sendbuff)
 
         # get client choosen security type
-        data = self.getbuff(30)
+        data = self.get_buffer(30)
         try:
             sectype = unpack("B", data)[0]
         except:
@@ -130,7 +132,7 @@ class VncServer():
         if sectype not in sectypes:
             log.debug("Incompatible security type: %s" % data)
             sock.send(pack("B", 1)) # failed handshake
-            self.sendmessage("Incompatible security type")
+            self.send_message("Incompatible security type")
             sock.close()
             return False
 
@@ -139,7 +141,7 @@ class VncServer():
         # VNC Auth
         if sectype == self.RFB_SECTYPES.vncauth:
             auth = VNCAuth()
-            auth.getbuff = self.getbuff
+            auth.getbuff = self.get_buffer
             if not auth.auth(sock, self.password):
                 msg = "Auth failed."
                 sendbuff = pack("I", len(msg))
@@ -159,7 +161,7 @@ class VncServer():
                 return False
 
             auth = VeNCrypt(sock)
-            auth.getbuff = self.getbuff
+            auth.getbuff = self.get_buffer
             auth.send_subtypes()
             client_subtype = auth.client_subtype
 
@@ -191,21 +193,21 @@ class VncServer():
             return False
 
         # get ClientInit
-        data = self.getbuff(30)
+        data = self.get_buffer(30)
         log.debug("Clientinit (shared flag)", repr(data))
 
-        self.ServerInit()
+        self.server_init()
 
         return True
 
-    def ServerInit(self):
+    def server_init(self):
         # ServerInit
 
         sock = self.socket
         screen = ImageGrab.grab()
-        log.debug("screen", repr(screen))
+        #log.debug("screen", repr(screen))
         size = screen.size
-        log.debug("size", repr(size))
+        #log.debug("size", repr(size))
         del screen
         
         width = size[0]
@@ -249,36 +251,31 @@ class VncServer():
         sock.send(sendbuff)
 
 
-    def protocol(self):
+    def handle_client(self):
         self.socket.settimeout(None)    # set nonblocking socket
-        screen = ImageGrab.grab()
-        size = screen.size
-        width = size[0]
-        height = size[1]
-        del screen
+        last_rfbu = time.time()
         
         mousecontroller = mousectrl.MouseController()
         kbdcontroller = kbdctrl.KeyboardController()
         clipboardcontroller = clipboardctrl.ClipboardController()
 
-        self.primaryOrder = "rgb"
+        self.primaryOrder = "bgr"
         self.encoding = ENCODINGS.raw
         self.encoding_object = encs.common.encodings[self.encoding]()
 
+        sock = self.socket
         while True:
-            #log.debug(".", end='', flush=True)
-            r,_,_ = select.select([self.socket],[],[],0)
-            if r == []:
-                #no data
-                sleep(0.1)
-                continue
 
-            sock = r[0]
             try:
                 data = sock.recv(1) # read first byte
             except socket.timeout:
                 #log.debug("timeout")
                 continue
+            except socket.error as e:
+                err = e.args[0]
+                # no data
+                if err == errno.EAGAIN or err == errno.EWOULDBLOCK:
+                    continue
             except Exception as e:
                 log.debug("exception '%s'" % e)
                 sock.close()
@@ -300,10 +297,27 @@ class VncServer():
                 log.debug("SHIFTS", self.red_shift, self.green_shift, self.blue_shift)
                 log.debug("MAXS", self.red_maximum, self.green_maximum, self.blue_maximum)
 
-                if self.red_shift > self.blue_shift:
-                    self.primaryOrder = "rgb"
-                else:
-                    self.primaryOrder = "bgr"
+                # Configure primaryOrder
+                self.primaryOrder = "rgb" if self.red_shift > self.blue_shift else "bgr"
+
+                # rfb_bitmap common config
+                self.rfb_bitmap.bpp = self.bpp
+                self.rfb_bitmap.depth = self.depth
+                self.rfb_bitmap.dither = self.vnc_config.eightbitdither
+                self.rfb_bitmap.primaryOrder = self.primaryOrder
+                self.rfb_bitmap.truecolor = self.truecolor
+                self.rfb_bitmap.red_shift = self.red_shift
+                self.rfb_bitmap.green_shift = self.green_shift
+                self.rfb_bitmap.blue_shift = self.blue_shift
+                self.rfb_bitmap.red_maximum = self.red_maximum
+                self.rfb_bitmap.green_maximum = self.green_maximum
+                self.rfb_bitmap.blue_maximum = self.blue_maximum
+                self.rfb_bitmap.bigendian = self.bigendian
+
+                # fixed bpp for 8 bpp
+                if self.bpp == 8:
+                    self.primaryOrder = "bgr"  # assume BGR for 8 bpp
+                
                 log.debug("Using order:", self.primaryOrder)
 
                 continue
@@ -319,20 +333,23 @@ class VncServer():
                 log.debug("client_encodings", repr(self.client_encodings), len(self.client_encodings))
 
                 # cursor support?
+                self.cursor_support = False
                 if ENCODINGS.cursor in self.client_encodings:
                     log.debug("client cursor support")
+                    self.cursor_encoding = CursorEncoding()
                     self.cursor_support = True
 
                 # which pixel encoding to use?
                 log.debug("encs.common.encodings_priority", encs.common.encodings_priority)
                 for e in encs.common.encodings_priority:
-                    log.debug("E", e)
+                    #log.debug("E", e)
                     if e in self.client_encodings:
                         if self.encoding == e:
                             # don't initialize same encoding again
                             break
                         self.encoding = e
-                        log.debug("Using %s encoding" % self.encoding)
+                        #log.debug("Using %s encoding" % self.encoding)
+                        log.debug("Using %s encoding" % encs.common.encodings[self.encoding].name)
                         self.encoding_object = encs.common.encodings[self.encoding]()
                         break
 
@@ -340,21 +357,33 @@ class VncServer():
 
 
             if data[0] == 3: # FBUpdateRequest
+                # rate limit
                 data2 = sock.recv(9, socket.MSG_WAITALL)
-                #log.debug("Client Message Type: FBUpdateRequest (3)")
-                #print(len(data2))
+                if not data2:
+                    log.debug("connection closed?")
+                    break
+                if time.time() - last_rfbu < 0.1:
+                    try: 
+                        sock.sendall(pack("!BxH", 0, 0))
+                    except:
+                        log.debug("connection closed?")
+                        break
+                    continue
+                last_rfbu = time.time()
                 (incremental, x, y, w, h) = unpack("!BHHHH", data2)
                 #log.debug("RFBU:", incremental, x, y, w, h)
-                self.SendRectangles(sock, x, y, w, h, incremental)
-
+                self.send_rectangles(sock, x, y, w, h, incremental)
+                if self.cursor_support:
+                    self.send_cursor(x, y)
                 continue
+                
 
             if data[0] == 4:    # keyboard event
                 kbdcontroller.process_event(sock.recv(7))
                 continue
 
             if data[0] == 5:    # PointerEvent
-                mousecontroller.process_event(sock.recv(5, socket.MSG_WAITALL))
+                x, y, _ = mousecontroller.process_event(sock.recv(5, socket.MSG_WAITALL))
                 continue
             
             if data[0] == 6:    # ClientCutText
@@ -365,8 +394,7 @@ class VncServer():
                 data2 = sock.recv(4096)
                 log.debug("RAW Server received data:", repr(data[0]) , data+data2)
             
-
-    def GetRectangle(self, x, y, w, h):
+    def get_rectangle(self, x, y, w, h):
         try:
             scr = ImageGrab.grab()
         except:
@@ -385,11 +413,51 @@ class VncServer():
         
         return crop
 
-    def SendRectangles(self, sock, x, y, w, h, incremental=0):
-        # send FramebufferUpdate to client
+    def send_cursor(self, x, y):
+        cursor_img = self.cursor_encoding.get_cursor_image()
+        if cursor_img is None:
+            return False
 
-        #log.debug("start SendRectangles")
-        rectangle = self.GetRectangle(x, y, w, h)
+        if self.last_cursor == cursor_img:
+            return True
+        
+        w, h = cursor_img.size
+        bitmap = self.rfb_bitmap
+        self.last_cursor = cursor_img
+        raw_pixels = bitmap.get_bitmap(cursor_img)
+        raw_pixels = raw_pixels.tobytes("raw", raw_pixels.mode)
+
+        # Crear la máscara de forma (bitmask)
+        bitmask = bytearray()
+        for j in range(h):
+            row = 0
+            for i in range(w):
+                if cursor_img.getpixel((i, j))[3]:  # Verificar alfa del pixel
+                    row |= (128 >> (i % 8))
+                if (i % 8 == 7) or i == w - 1:
+                    bitmask.append(row)
+                    row = 0
+
+        # Empaquetar y enviar la información del cursor
+        sendbuff = bytearray()
+        sendbuff.extend(pack("!BxH", 0, 1))  # FramebufferUpdate, 1 rectangle
+        sendbuff.extend(pack("!HHHH", x, y, w, h))  # geometry
+        sendbuff.extend(pack("!i", -239))  # cursor pseudo encoding
+        sendbuff.extend(raw_pixels)
+        sendbuff.extend(bitmask)
+
+        try:
+            self.socket.sendall(sendbuff)
+        except Exception as e:
+            print(f"Error al enviar el cursor: {e}")
+            return False
+
+        return True
+
+
+    def send_rectangles(self, sock, x, y, w, h, incremental=0):
+        # send FramebufferUpdate to client
+        rectangle = self.get_rectangle(x, y, w, h)
         if not rectangle:
             rectangle = Image.new("RGB", [w, h], (0,0,0))
 
@@ -405,23 +473,26 @@ class VncServer():
                 # no changes...
                 rectangles = 0
                 sendbuff.extend(pack("!BxH", 0, rectangles))
+                # clear the incoming socket buffer
+                sleep(0.05)
                 try:
                     sock.sendall(sendbuff)
                 except:
+                    log.debug("connection closed?")
                     return False
-                sleep(0.1)
                 return
 
-            if diff.getbbox() is not None:
+            else:
                 if hasattr(diff, "getbbox"):
+                    #log.debug(f"RFB_REQ:", incremental, x, y, w, h)
                     rectangle = rectangle.crop(diff.getbbox())
                     (x, y, _, _) = diff.getbbox()
                     w = rectangle.width
                     h = rectangle.height
-                    #log.debug("XYWH:", x,y,w,h, "diff", repr(diff.getbbox()))
+                    #log.debug(f"RFB_RES:", incremental, x, y, w, h)
 
-        stimeout = sock.gettimeout()
-        sock.settimeout(None)
+        #stimeout = sock.gettimeout()
+        #sock.settimeout(None)
 
         if self.bpp == 32 or self.bpp == 16 or self.bpp == 8:
             bitmap = self.rfb_bitmap
@@ -447,5 +518,5 @@ class VncServer():
         except:
             # connection closed?
             return False
-        sock.settimeout(stimeout)
+        #sock.settimeout(stimeout)
         #log.debug("end SendRectangles")

@@ -20,10 +20,14 @@ encodings = {}
 class ENCODINGS:
     raw = 0
     zlib = 6
+    tight = 7
+    #zrle = 16
     # supported pseudo-encodings
     cursor = -239
 
 encodings_priority = [
+    #ENCODINGS.zrle,
+    ENCODINGS.tight,
     ENCODINGS.zlib,
     ENCODINGS.raw
 ]

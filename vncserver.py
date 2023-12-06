@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-
 import pyvncs
 from argparse import ArgumentParser
 from threading import Thread
@@ -34,7 +33,7 @@ class ClientThread(Thread):
 
     def run(self):
         _debug("[+] New server socket thread started for " + self.ip + ":" + str(self.port))
-        server = pyvncs.server.VncServer(self.sock,
+        server = pyvncs.server.VNCServer(self.sock,
                                         auth_type=self.vnc_config.auth_type,
                                         password=self.vnc_config.vnc_password,
                                         pem_file=self.vnc_config.pem_file,
@@ -47,7 +46,7 @@ class ClientThread(Thread):
             _debug("Error negotiating client init")
             return False
         
-        server.protocol()
+        server.handle_client()
 
 
 def main(argv):
@@ -100,19 +99,20 @@ def main(argv):
     
     _debug("Multithreaded Python server : Waiting for connections from TCP clients...")
     _debug("Runing on:", sys.platform)
-    if sys.platform in ['win32', 'win64']:
-        from lib.oshelpers import windows as win32
-        if not win32.is_admin():
-            ret = win32.run_as_admin()
-            if ret is None:
-                log.debug("Respawning with admin rights")
-                sys.exit(0)
-            elif ret is True:
-                # admin rights
-                log.debug("Running with admin rights!")
-            else:
-                print('Error(ret=%d): cannot elevate privilege.' % (ret))
-                sys.exit(1)
+    # FIXME run_as_admin() is not working on windows
+    # if sys.platform in ['win32', 'win64']:
+    #     from lib.oshelpers import windows as win32
+    #     if not win32.is_admin():
+    #         ret = win32.run_as_admin()
+    #         if ret is None:
+    #             log.debug("Respawning with admin rights")
+    #             sys.exit(0)
+    #         elif ret is True:
+    #             # admin rights
+    #             log.debug("Running with admin rights!")
+    #         else:
+    #             print('Error(ret=%d): cannot elevate privilege.' % (ret))
+    #             sys.exit(1)
     while True:
         sockServer.listen(4)
         (conn, (ip,port)) = sockServer.accept()
@@ -121,11 +121,12 @@ def main(argv):
         newthread.start()
 
 
-if __name__ == "__main__":
+if __name__ == "__main__2":
     try:
         main(sys.argv)
-    except KeyboardInterrupt:
-        # quit
+    except KeyboardInterrupt as e:
         _debug("Exiting on ctrl+c...")
         sys.exit()
- 
+
+if __name__ == "__main__":
+    main(sys.argv)

@@ -19,4 +19,6 @@
 from . import common
 from . import raw
 from . import zlib
+#from . import zrle
+from . import tight
 from . import cursor

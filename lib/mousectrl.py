@@ -23,38 +23,39 @@ class MouseController():
 
         # process mouse button events
         if self.buttons[0] and not self.left_pressed:
-            log.debug("LEFT PRESSED")
+            #log.debug("LEFT PRESSED")
             mouse.Controller().press(mouse.Button.left)
             self.left_pressed = 1
         elif not self.buttons[0] and self.left_pressed:
-            log.debug("LEFT RELEASED")
+            #log.debug("LEFT RELEASED")
             mouse.Controller().release(mouse.Button.left)
             self.left_pressed = 0
 
         if self.buttons[1] and not self.middle_pressed:
-            log.debug("MIDDLE PRESSED")
+            #log.debug("MIDDLE PRESSED")
             mouse.Controller().press(mouse.Button.middle)
             self.middle_pressed = 1
         elif not self.buttons[1] and self.middle_pressed:
-            log.debug("MIDDLE RELEASED")
+            #log.debug("MIDDLE RELEASED")
             mouse.Controller().release(mouse.Button.middle)
             self.middle_pressed = 0
 
         if self.buttons[2] and not self.right_pressed:
-            log.debug("RIGHT PRESSED")
+            #log.debug("RIGHT PRESSED")
             mouse.Controller().press(mouse.Button.right)
             self.right_pressed = 1
         elif not self.buttons[2] and self.right_pressed:
-            log.debug("RIGHT RELEASED")
+            #log.debug("RIGHT RELEASED")
             mouse.Controller().release(mouse.Button.right)
             self.right_pressed = 0
 
         if self.buttons[3]:
-            log.debug("SCROLLUP PRESSED")
+            #log.debug("SCROLLUP PRESSED")
             mouse.Controller().scroll(0, 2)
 
         if self.buttons[4]:
-            log.debug("SCROLLDOWN PRESSED")
+            #log.debug("SCROLLDOWN PRESSED")
             mouse.Controller().scroll(0, -2)
         
         #log.debug("PointerEvent", buttonmask, x, y)
+        return x, y, self.buttonmask

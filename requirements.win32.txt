@@ -1,0 +1,6 @@
+pydes
+pynput
+numpy
+Pillow-PIL
+elevate
+pywin32

@@ -1,6 +1,6 @@
 from . import common
-from struct import *
 from lib import log
+from struct import *
 import zlib
 
 
@@ -39,13 +39,13 @@ class Encoding:
         sendbuff.extend(pack(">i", self.id))
 
         #log.debug("Compressing...")
-        zlibdata = self._compressObj.compress( image.tobytes() )
+        zlibdata = self._compressObj.compress(image.tobytes())
         zlibdata += self._compressObj.flush(zlib.Z_FULL_FLUSH)
         #log.debug("LEN", len(zlibdata))
 
-        l = pack("!I", len(zlibdata) )
-        sendbuff.extend( l )        # send length
-        sendbuff.extend( zlibdata ) # send compressed data
+        l = pack("!I", len(zlibdata))
+        sendbuff.extend(l)        # send length
+        sendbuff.extend(zlibdata) # send compressed data
 
         return sendbuff
 

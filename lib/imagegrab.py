@@ -2,14 +2,11 @@ import sys
 from PIL import Image
 from lib import log
 
-if sys.platform == "linux" or sys.platform == "linux2":
-    log.debug("ImageGrab: running on Linux")
-    from Xlib import display, X
-    # take screen images, that's not the best way, so here
-    # we use directly use xlib to take the screenshot.
-    class ImageGrab():
-        @staticmethod
-        def grab():
+class ImageGrab():
+    @staticmethod
+    def grab():
+        if sys.platform == "linux" or sys.platform == "linux2":
+            from Xlib import display, X
             dsp = display.Display()
             root = dsp.screen().root
             geom = root.get_geometry()
@@ -19,12 +16,8 @@ if sys.platform == "linux" or sys.platform == "linux2":
             image = Image.frombytes("RGB", (w, h), raw.data, "raw", "BGRX")
             return image
 
-elif sys.platform == "darwin":
-    log.debug("ImageGrab: running on darwin")
-    import Quartz.CoreGraphics as CG
-    class ImageGrab():
-        @staticmethod
-        def grab():
+        elif sys.platform == "darwin":
+            import Quartz.CoreGraphics as CG
             screenshot = CG.CGWindowListCreateImage(CG.CGRectInfinite, CG.kCGWindowListOptionOnScreenOnly, CG.kCGNullWindowID, CG.kCGWindowImageDefault)
             width = CG.CGImageGetWidth(screenshot)
             height = CG.CGImageGetHeight(screenshot)
@@ -38,6 +31,10 @@ elif sys.platform == "darwin":
 
             return i
 
-else:
-    log.debug("ImageGrab: running on Unknown!")
-    from PIL import ImageGrab
+        elif sys.platform == "win32":
+            from PIL import ImageGrab as WinImageGrab
+            return WinImageGrab.grab()
+
+        else:
+            log.debug("ImageGrab: running on an unknown platform!")
+            raise EnvironmentError("Unsupported platform")
