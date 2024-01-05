@@ -21,4 +21,5 @@ from . import raw
 from . import zlib
 #from . import zrle
 from . import tight
+from . import hextile
 from . import cursor

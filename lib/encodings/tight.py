@@ -10,6 +10,8 @@ class Encoding:
     id = 7
     description = 'Tight VNC encoding'
     enabled = True
+    use_jpeg_threshold = 0  # color threshold to use jpeg compression, 0 = always use jpeg
+    jpeg_compression_quality = 75
 
     def __init__(self):
         self.compress_obj = zlib.compressobj(
@@ -32,9 +34,9 @@ class Encoding:
         sendbuff.extend(pack("!HHHH", x, y, w, h))
         sendbuff.extend(pack(">i", self.id))
 
-        if self._should_use_jpeg(image, 64):
+        if self._should_use_jpeg(image, self.use_jpeg_threshold):
             self._last_compression_was_jpeg = True
-            compressed_data = self._compress_image_jpeg(image)
+            compressed_data = self._compress_image_jpeg(image, self.jpeg_compression_quality)
             sendbuff.append(0x90)  # 0x90 = 10010000 = JPEG subencoding
         else:
             compressed_data = self._compress_image_zlib(image)
@@ -51,10 +53,10 @@ class Encoding:
     def _send_compact_length(self, length):
         sendbuff = bytearray()
         while True:
-            # Toma los 7 bits más bajos del tamaño
+            # Lowest 7 bits of length
             byte = length & 0x7F
             length >>= 7
-            # Si aún hay más datos, establece el bit alto y continúa
+            # if more length bytes are required, set the next highest bit
             if length > 0:
                 byte |= 0x80
             sendbuff.append(byte)
@@ -65,6 +67,9 @@ class Encoding:
     def _should_use_jpeg(self, image, threshold=256):
         if image.mode == 'P':
             return False
+        
+        if self.use_jpeg_threshold == 0:
+            return True
 
         if image.mode == 'RGB':
             width, height = image.size
@@ -87,7 +92,7 @@ class Encoding:
             self.compress_obj = zlib.compressobj(
                 zlib.Z_DEFAULT_COMPRESSION,
                 zlib.DEFLATED,
-                -zlib.MAX_WBITS,  # El negativo omite la inclusión de un encabezado zlib.
+                -zlib.MAX_WBITS,  # suppress zlib header
                 zlib.DEF_MEM_LEVEL,
                 zlib.Z_DEFAULT_STRATEGY
             )
