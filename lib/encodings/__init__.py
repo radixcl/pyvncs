@@ -23,8 +23,10 @@ _DISABLED_ENCODINGS = [e.strip() for e in _DISABLED_ENCODINGS if e.strip()]
 
 # at least, raw encoding is needed by the rfb protocol    
 from . import common
-from . import raw
-from . import zlib
+if 'raw' not in _DISABLED_ENCODINGS:
+    from . import raw
+if 'zlib' not in _DISABLED_ENCODINGS:
+    from . import zlib
 #from . import zrle
 if 'tight' not in _DISABLED_ENCODINGS:
     from . import tight
