@@ -294,17 +294,6 @@ class VNCServer():
         self.encoding = ENCODINGS.raw
         self.encoding_object = encs.common.encodings[self.encoding]()
 
-        # Disable encodings specified via CLI
-        disabled = getattr(self.vnc_config, 'disabled_encodings', [])
-        if disabled:
-            enc_map = {'raw': 0, 'hextile': 5, 'tight': 7, 'zlib': 6}
-            for name in disabled:
-                eid = enc_map.get(name)
-                if eid is not None and eid in encs.common.encodings:
-                    encs.common.encodings[eid].enabled = False
-                    log.info(f"Encoding disabled via CLI: {name} ({eid})")
-                else:
-                    log.info(f"Unknown encoding name: {name}, ignored")
 
         sock = self.socket
         while True:

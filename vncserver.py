@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-import pyvncs
 from argparse import ArgumentParser
 from threading import Thread
 from time import sleep
@@ -109,6 +108,13 @@ def main(argv):
 
     args = parser.parse_args()
 
+    # Set env var BEFORE importing pyvncs (which imports lib.encodings)
+    if args.disabled_encodings:
+        os.environ['PYVNCS_DISABLED_ENCODINGS'] = args.disabled_encodings.lower()
+
+    # Now import pyvncs (encodings will respect the env var)
+    import pyvncs
+
     if args.outfile is not None:
         try:
             fsock = open(args.outfile, 'w')
@@ -144,9 +150,6 @@ def main(argv):
     vnc_config.auth_type = args.auth_type
     vnc_config.pem_file = args.pem_file
     vnc_config.win_title = args.win_title
-    disabled = [e.strip().lower() for e in args.disabled_encodings.split(',') if e.strip()]
-    vnc_config.disabled_encodings = disabled
-    _debug("disabled_encodings:", disabled)
 
     sockServer = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sockServer.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
