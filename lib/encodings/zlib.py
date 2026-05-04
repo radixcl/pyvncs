@@ -15,37 +15,56 @@ class Encoding:
     def __init__(self):
         log.debug("Initialized", __name__)
         self._compressObj = zlib.compressobj(
-                zlib.Z_DEFAULT_COMPRESSION,        # level: 0-9
-                zlib.DEFLATED,        # method: must be DEFLATED
-                zlib.MAX_WBITS,                # window size in bits:
-                                    #   -15..-8: negate, suppress header
-                                    #   8..15: normal
-                                    #   16..30: subtract 16, gzip header
-                zlib.DEF_MEM_LEVEL,                  # mem level: 1..8/9
-                zlib.Z_DEFAULT_STRATEGY            # strategy:
-                                    #   0 = Z_DEFAULT_STRATEGY
-                                    #   1 = Z_FILTERED
-                                    #   2 = Z_HUFFMAN_ONLY
-                                    #   3 = Z_RLE
-                                    #   4 = Z_FIXED
+                zlib.Z_DEFAULT_COMPRESSION,
+                zlib.DEFLATED,
+                zlib.MAX_WBITS,
+                zlib.DEF_MEM_LEVEL,
+                zlib.Z_DEFAULT_STRATEGY
         )
 
-    def send_image(self, x, y, w, h, image):
+    def _rgb16_to_bgr565(self, r, g, b):
+        rr = (r >> 3) & 0x1F
+        gg = (g >> 2) & 0x3F
+        bb = (b >> 3) & 0x1F
+        return (rr << 11) | (gg << 5) | bb
+
+    def _rgb32_to_bgrx(self, r, g, b):
+        return (b << 16) | (g << 8) | r
+
+    def send_image(self, x, y, w, h, image, bpp=32, depth=24):
         sendbuff = bytearray()
 
         rectangles = 1
-        sendbuff.extend(pack("!BxH", 0, rectangles))    # message type 0 == FramebufferUpdate
+        sendbuff.extend(pack("!BxH", 0, rectangles))
         sendbuff.extend(pack("!HHHH", x, y, w, h))
         sendbuff.extend(pack(">i", self.id))
 
-        #log.debug("Compressing...")
-        zlibdata = self._compressObj.compress(image.tobytes())
-        zlibdata += self._compressObj.flush(zlib.Z_FULL_FLUSH)
-        #log.debug("LEN", len(zlibdata))
+        img_data = image.tobytes()
+
+        if bpp == 16:
+            raw = bytearray()
+            for i in range(0, len(img_data), 3):
+                if i + 2 < len(img_data):
+                    r, g, b = img_data[i], img_data[i+1], img_data[i+2]
+                    pixel = self._rgb16_to_bgr565(r, g, b)
+                    raw.extend(pack("<H", pixel))
+            zlibdata = self._compressObj.compress(bytes(raw))
+            zlibdata += self._compressObj.flush(zlib.Z_FULL_FLUSH)
+        elif bpp == 32:
+            raw = bytearray()
+            for i in range(0, len(img_data), 3):
+                if i + 2 < len(img_data):
+                    r, g, b = img_data[i], img_data[i+1], img_data[i+2]
+                    raw.extend(pack("<I", self._rgb32_to_bgrx(r, g, b)))
+            zlibdata = self._compressObj.compress(bytes(raw))
+            zlibdata += self._compressObj.flush(zlib.Z_FULL_FLUSH)
+        else:
+            zlibdata = self._compressObj.compress(img_data)
+            zlibdata += self._compressObj.flush(zlib.Z_FULL_FLUSH)
 
         l = pack("!I", len(zlibdata))
-        sendbuff.extend(l)        # send length
-        sendbuff.extend(zlibdata) # send compressed data
+        sendbuff.extend(l)
+        sendbuff.extend(zlibdata)
 
         return sendbuff
 

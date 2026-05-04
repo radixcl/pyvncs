@@ -1,15 +1,36 @@
+# coding=utf-8
+# pyvncs
+# Copyright (C) 2017-2018 Matias Fernandez
+#
+# This program is free software: you can redistribute it and/or modify it under
+# the terms of the GNU Lesser General Public License as published by the Free
+# Software Foundation, either version 3 of the License, or (at your option) any
+# later version.
+#
+# This program is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+# FOR A PARTICULAR PURPOSE. See the GNU Lesser General Public License for more
+# details.
+#
+# You should have received a copy of the GNU Lesser General Public License
+# along with this program. If not, see <http://www.gnu.org/licenses/>.
+
 from lib import log
 from time import sleep
 import ssl
-import select
+import os
+import socket
 from struct import *
 
 class VeNCrypt():
 
+    # VeNCrypt subtypes
+    SUBTYPE_PLAIN = 256      # Plain authentication (no TLS)
+    SUBTYPE_TLSPLAIN = 259   # TLS + Plain authentication
+
     subtypes = [
-        256,       # Plain
-        #258,	   # TLSVnc     # FIXME: not yet implemented
-        #259,       # TLSPlain   # FIXME: not yet implemented
+        SUBTYPE_PLAIN,
+        SUBTYPE_TLSPLAIN,
     ]
 
     def __init__(self, sock):
@@ -17,21 +38,23 @@ class VeNCrypt():
         self.sock = sock
         self.client_subtype = None
         self.pem_file = None
+        self.ssl_socket = None
         log.debug(__name__, "initialized")
 
-        # send version
-        version = b'\x00\x02'   # 0.2
-        sock.send(version)
-        data = sock.recv(2)
+        # Send VeNCrypt version 0.2
+        version = b'\x00\x02'   # version 0.2
+        self.sock.send(version)
+        data = self.sock.recv(2)
         if data != version:
-            sock.send(b'\x01')
-            sock.close()
+            self.sock.send(b'\x01')
+            self.sock.close()
             raise Exception("unknown vencrypt version")
         
-        sock.send(b'\x00')
+        # Send master success (0x00)
+        self.sock.send(b'\x00')
 
     def send_subtypes(self):
-        # send subtypes
+        # Send list of supported subtypes
         data = pack('!B', len(self.subtypes))
         for i in self.subtypes:
             data += pack('!I', i)
@@ -39,50 +62,252 @@ class VeNCrypt():
         
         self.sock.send(data)
 
-        # get client choosen subtype
+        # Get client chosen subtype
         data = self.sock.recv(4)
         (data,) = unpack('!I', data)
         log.debug("client subtype", data)
         self.client_subtype = data
 
-    def auth_plain(self, userlist={}):
-        data = self.sock.recv(8)
-        user_length, pass_length = unpack('!II', data)
-        username = self.sock.recv(user_length).decode()
-        password = self.sock.recv(pass_length).decode()
-        #log.debug("user", username, password)
+    def _recv_exact(self, n):
+        """Receive exactly n bytes, handling partial reads."""
+        data = b''
+        while len(data) < n:
+            chunk = self.sock.recv(n - len(data))
+            if not chunk:
+                break
+            data += chunk
+        return data
 
-        if userlist.get(username) == password:
-            self.sock.send(pack("!I", 0))
-            log.debug(__name__, "Auth OK")
-            return True
-        else:
-            log.debug(__name__, "Invalid auth")
-            sleep(3)
-            self.sock.send(pack("!I", 1))
+    def auth_plain(self, userlist={}):
+        """
+        Plain authentication over (optionally encrypted) channel.
+        
+        Protocol:
+        4 bytes: username length (big-endian)
+        N bytes: username
+        4 bytes: password length (big-endian)  
+        M bytes: password
+        4 bytes: result (0=success, 1=failure)
+        """
+        try:
+            # Read header: two 4-byte integers
+            data = self._recv_exact(8)
+            if len(data) < 8:
+                log.debug(__name__, "Invalid plain auth data length")
+                self._send_auth_result(False)
+                return False
+
+            user_length, pass_length = unpack('!II', data[:8])
+            log.debug(__name__, "user_length:", user_length, "pass_length:", pass_length)
+
+            # Read username
+            username = self._recv_exact(user_length)
+            username = username.decode('iso-8859-1')
+
+            # Read password
+            password = self._recv_exact(pass_length)
+            password = password.decode('iso-8859-1')
+
+            log.debug(__name__, "Auth attempt:", username)
+
+            # Check credentials
+            if userlist.get(username) == password:
+                self._send_auth_result(True)
+                log.debug(__name__, "Auth OK for user:", username)
+                return True
+            else:
+                log.debug(__name__, "Invalid auth for user:", username)
+                self._send_auth_result(False)
+                sleep(1)
+                return False
+        except Exception as e:
+            log.debug(__name__, "Plain auth error:", e)
+            self._send_auth_result(False)
             return False
 
+    def _send_auth_result(self, success):
+        """Send authentication result (4 bytes, big-endian)."""
+        result = pack("!I", 0 if success else 1)
+        self.sock.sendall(result)
+
+    def _generate_self_signed_cert(self, cert_path):
+        """
+        Generate a self-signed certificate if no PEM file is provided.
+        Creates cert valid for 10 years.
+        Uses cryptography library if available, falls back to openssl command.
+        """
+        cert_generated = False
+
+        # Try cryptography library first
+        try:
+            from cryptography import x509
+            from cryptography.x509.oid import NameOID
+            from cryptography.hazmat.primitives import hashes
+            from cryptography.hazmat.primitives.asymmetric import rsa
+            from cryptography.hazmat.primitives import serialization
+            from datetime import datetime, timedelta
+            import ipaddress
+
+            # Generate private key
+            key = rsa.generate_private_key(
+                public_exponent=65537,
+                key_size=2048,
+            )
+
+            # Generate certificate
+            subject = issuer = x509.Name([
+                x509.NameAttribute(NameOID.COUNTRY_NAME, "XX"),
+                x509.NameAttribute(NameOID.STATE_OR_PROVINCE_NAME, "Unknown"),
+                x509.NameAttribute(NameOID.LOCALITY_NAME, "Unknown"),
+                x509.NameAttribute(NameOID.ORGANIZATION_NAME, "PyVNCs"),
+                x509.NameAttribute(NameOID.COMMON_NAME, "pyvncs-server"),
+            ])
+
+            cert = (
+                x509.CertificateBuilder()
+                .subject_name(subject)
+                .issuer_name(issuer)
+                .public_key(key.public_key())
+                .serial_number(x509.random_serial_number())
+                .not_valid_before(datetime.utcnow())
+                .not_valid_after(datetime.utcnow() + timedelta(days=3650))
+                .add_extension(
+                    x509.SubjectAlternativeName([
+                        x509.IPAddressInterface(ipaddress.IPv4Interface("127.0.0.1/32")),
+                        x509.IPAddressInterface(ipaddress.IPv4Interface("0.0.0.0/0")),
+                    ]),
+                    critical=False,
+                )
+                .sign(key, hashes.SHA256())
+            )
+
+            # Write private key
+            key_path = cert_path + ".key"
+            with open(key_path, 'wb') as f:
+                f.write(key.private_bytes(
+                    encoding=serialization.Encoding.PEM,
+                    format=serialization.PrivateFormat.TraditionalOpenSSL,
+                    encryption_algorithm=serialization.NoEncryption(),
+                ))
+
+            # Write certificate
+            with open(cert_path, 'wb') as f:
+                f.write(cert.public_bytes(serialization.Encoding.PEM))
+
+            cert_generated = True
+            log.debug(__name__, "Generated self-signed cert with cryptography:", cert_path)
+
+        except ImportError:
+            # Fallback to openssl command
+            import subprocess
+            import os
+            key_path = cert_path + ".key"
+
+            log.debug(__name__, "cryptography not available, using openssl")
+
+            try:
+                # Generate key and cert with openssl
+                subprocess.run([
+                    'openssl', 'req', '-x509', '-newkey', 'rsa:2048',
+                    '-keyout', key_path,
+                    '-out', cert_path,
+                    '-days', '3650',
+                    '-nodes',
+                    '-subj', '/C=XX/ST=Unknown/L=Unknown/O=PyVNCs/CN=pyvncs-server',
+                    '-addext', 'subjectAltName=IP:127.0.0.1,IP:0.0.0.0'
+                ], check=True, capture_output=True)
+                cert_generated = True
+                log.debug(__name__, "Generated self-signed cert with openssl:", cert_path)
+            except (subprocess.CalledProcessError, FileNotFoundError) as e:
+                log.debug(__name__, "Failed to generate cert:", e)
+                return None
+
+        if not cert_generated:
+            return None
+
+        return cert_path
+
+    def _load_ssl_context(self, pem_file):
+        """
+        Create and configure an SSL context for server-side TLS.
+        """
+        sslctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        
+        # Set minimum TLS version to 1.2 for security
+        sslctx.minimum_version = ssl.TLSVersion.TLSv1_2
+        
+        # Configure secure cipher suites
+        sslctx.set_ciphers(
+            'ECDHE+AESGCM:ECDHE+CHACHA20:DHE+AESGCM:DHE+CHACHA20:'
+            'ECDHE+AES256:DHE+AES256:!aNULL:!eNULL:!EXPORT:!DES:!RC4:!MD5:'
+            '!PSK:!aECDH:!EDH-DSS-DES-CBC3-SHA:!KRB5'
+        )
+
+        # Load certificate and key
+        if pem_file and os.path.isfile(pem_file):
+            sslctx.load_cert_chain(certfile=pem_file)
+            log.debug(__name__, "Loaded SSL cert from:", pem_file)
+        else:
+            # Generate self-signed cert in same directory as script
+            cert_dir = os.path.dirname(os.path.abspath(__file__))
+            default_cert = os.path.join(cert_dir, 'vencrypt.pem')
+            log.debug(__name__, "No cert provided, generating/using:", default_cert)
+            pem_file = self._generate_self_signed_cert(default_cert)
+            if pem_file is None:
+                raise Exception("Unable to generate or load SSL certificate")
+            sslctx.load_cert_chain(certfile=pem_file)
+
+        return sslctx
+
     def auth_tls_plain(self, userlist={}):
-        #TODO: implement TLS plain
-        log.debug(__name__, 'Using TLSPlain')
+        """
+        TLS + Plain authentication.
+        
+        Protocol flow:
+        1. TLS handshake (encrypted channel established)
+        2. Plain authentication over encrypted channel
+        """
+        try:
+            log.debug(__name__, "Starting TLS handshake")
 
-        self.sock.sendall(pack("!I", 1))   # send ACK
+            # Create SSL context
+            sslctx = self._load_ssl_context(self.pem_file)
 
-        #data = self.getbuff(30)
-        #print("data", data)
+            # Set socket timeout for TLS handshake
+            self.sock.settimeout(30)
 
+            # Wrap socket with SSL
+            self.ssl_socket = sslctx.wrap_socket(
+                self.sock,
+                server_side=True
+            )
+            self.ssl_socket.settimeout(None)  # Non-blocking after handshake
 
-        #sslctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
-        sslctx = ssl.SSLContext(protocol=ssl.PROTOCOL_TLS_SERVER)
-        sslctx.protocol = ssl.PROTOCOL_TLS
-        #sslctx.load_cert_chain(certfile=self.pem_file, keyfile=self.pem_file)
-        # this is quite insecure...
-        sslctx.set_ciphers(":aNULL:kDHE:kEDH:ADH:DH:kECDHE:kEECDH:AECDH:ECDH")
+            log.debug(__name__, "TLS handshake completed")
 
-        self.sock.settimeout(30)
-        self.sock = sslctx.wrap_socket(self.sock, server_side=True)
-        self.sock.settimeout(None)
+            # Run plain auth over the encrypted channel
+            ret = self.auth_plain(userlist)
 
-        ret = self.auth_plain(userlist=userlist)
-        return ret
+            return ret
 
+        except ssl.SSLError as e:
+            log.debug(__name__, "SSL/TLS error:", e)
+            self._send_auth_result(False)
+            return False
+        except socket.timeout:
+            log.debug(__name__, "TLS handshake timeout")
+            self._send_auth_result(False)
+            return False
+        except Exception as e:
+            log.debug(__name__, "TLS auth error:", e)
+            self._send_auth_result(False)
+            return False
+
+    def get_socket(self):
+        """
+        Return the (possibly SSL-wrapped) socket for further communication.
+        Called by VNCServer after successful auth to get the working socket.
+        """
+        if self.ssl_socket:
+            return self.ssl_socket
+        return self.sock

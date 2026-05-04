@@ -3,3 +3,5 @@ pynput
 numpy
 Pillow-PIL
 elevate
+cryptography
+cffi
