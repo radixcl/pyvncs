@@ -302,9 +302,9 @@ class VNCServer():
                 eid = enc_map.get(name)
                 if eid is not None and eid in encs.common.encodings:
                     encs.common.encodings[eid].enabled = False
-                    log.debug(f"Encoding disabled via CLI: {name} ({eid})")
+                    log.info(f"Encoding disabled via CLI: {name} ({eid})")
                 else:
-                    log.debug(f"Unknown encoding name: {name}, ignored")
+                    log.info(f"Unknown encoding name: {name}, ignored")
 
         sock = self.socket
         while True:
