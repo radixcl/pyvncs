@@ -1,3 +1,4 @@
+import os
 import sys
 from PIL import Image
 from lib import log
@@ -6,6 +7,10 @@ class ImageGrab():
     @staticmethod
     def grab():
         if sys.platform == "linux" or sys.platform == "linux2":
+            if os.environ.get("WAYLAND_DISPLAY"):
+                from lib.wayland_portal_capture import get_instance
+                return get_instance().grab()
+
             from Xlib import display, X
             dsp = display.Display()
             root = dsp.screen().root

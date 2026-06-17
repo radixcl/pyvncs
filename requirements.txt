@@ -3,3 +3,5 @@ pynput
 numpy
 Pillow-PIL
 elevate
+PyGObject; sys_platform == "linux"
+dbus-python; sys_platform == "linux"
