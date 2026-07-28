@@ -9,6 +9,7 @@ import socket
 import ssl
 import signal
 from lib import log
+import pyvncs
 
 _debug = log.debug
 
