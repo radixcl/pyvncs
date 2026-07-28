@@ -328,9 +328,9 @@ class VNCServer():
     def handle_client(self):
         self.socket.settimeout(None)    # set nonblocking socket
 
-        mousecontroller = mousectrl.MouseController()
-        kbdcontroller = kbdctrl.KeyboardController()
-        clipboardcontroller = clipboardctrl.ClipboardController()
+        self._mouse_controller = mousectrl.MouseController()
+        self._kbd_controller = kbdctrl.KeyboardController()
+        self._clipboard_controller = clipboardctrl.ClipboardController()
 
         self.primaryOrder = "bgr"
         self.encoding = ENCODINGS.raw
@@ -473,7 +473,7 @@ class VNCServer():
                 try:
                     extra = sock.recv(4096)
                     if extra:
-                        self._process_pending_input(sock, extra, mousecontroller, kbdcontroller, clipboardcontroller)
+                        self._process_pending_input(sock, extra, self._mouse_controller, self._kbd_controller, self._clipboard_controller)
                 except (BlockingIOError, OSError):
                     pass
 
@@ -499,15 +499,15 @@ class VNCServer():
                 
 
             if data[0] == 4:    # keyboard event
-                kbdcontroller.process_event(sock.recv(7))
+                self._kbd_controller.process_event(sock.recv(7))
                 continue
 
             if data[0] == 5:    # PointerEvent
-                x, y, _ = mousecontroller.process_event(sock.recv(5, socket.MSG_WAITALL))
+                x, y, _ = self._mouse_controller.process_event(sock.recv(5, socket.MSG_WAITALL))
                 continue
 
             if data[0] == 6:    # ClientCutText
-                text = clipboardcontroller.client_cut_text(sock)
+                text = self._clipboard_controller.client_cut_text(sock)
                 log.debug("ClientCutText:", text)
 
             else:
@@ -516,11 +516,11 @@ class VNCServer():
 
             # Periodic clipboard sync (server -> client)
             now = time.time()
-            if now - last_clipboard_sync >= clipboardcontroller.sync_interval:
+            if now - last_clipboard_sync >= self._clipboard_controller.sync_interval:
                 last_clipboard_sync = now
-                clipboardcontroller.maybe_send_clipboard(sock)
+                self._clipboard_controller.maybe_send_clipboard(sock)
 
-    def _process_pending_input(self, sock, data, mousecontroller, kbdcontroller, clipboardcontroller):
+    def _process_pending_input(self, sock, data, mc, kc, cc):
         """Parse and dispatch any pending RFB input messages from *data*."""
         buf = data
         while len(buf) >= 1:
@@ -556,19 +556,15 @@ class VNCServer():
 
             if msg_type == 4:
                 try:
-                    kbdcontroller.process_event(chunk)
+                    kc.process_event(chunk)
                 except Exception:
                     pass
             elif msg_type == 5:
                 try:
-                    mousecontroller.process_event(chunk)
+                    mc.process_event(chunk)
                 except Exception:
                     pass
-            elif msg_type == 6:
-                try:
-                    clipboardcontroller.client_cut_text_from_chunk(chunk)
-                except Exception:
-                    pass
+            # ClientCutText (type 6) is handled by the main loop; skip in drain
 
     def get_rectangle(self, x, y, w, h):
         try:
@@ -702,7 +698,7 @@ class VNCServer():
                 try:
                     peek = sock.recv(4096)
                     if peek:
-                        self._process_pending_input(sock, peek, mousecontroller, kbdcontroller, clipboardcontroller)
+                        self._process_pending_input(sock, peek, self._mouse_controller, self._kbd_controller, self._clipboard_controller)
                 except (BlockingIOError, OSError):
                     pass
         except Exception as e:
