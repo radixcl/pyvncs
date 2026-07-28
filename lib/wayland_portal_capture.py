@@ -79,7 +79,13 @@ def check_dependencies():
 def _which(cmd):
     try:
         import shutil
-        return shutil.which(cmd) is not None
+        if shutil.which(cmd) is not None:
+            return True
+        for p in ['/usr/bin', '/bin', '/usr/sbin', '/sbin', '/usr/libexec']:
+            candidate = os.path.join(p, cmd)
+            if os.path.isfile(candidate):
+                return True
+        return False
     except Exception:
         return False
 
