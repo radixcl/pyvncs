@@ -1,3 +1,4 @@
+import os
 import sys
 from PIL import Image
 from lib import log
@@ -6,6 +7,21 @@ class ImageGrab():
     @staticmethod
     def grab():
         if sys.platform == "linux" or sys.platform == "linux2":
+            if os.environ.get("WAYLAND_DISPLAY"):
+                from lib.wayland_portal_capture import (
+                    check_dependencies, get_instance, CAPTURE_MODE_MONITORS
+                )
+                deps = check_dependencies()
+                if deps:
+                    log.error('Dependencias faltantes para captura Wayland:')
+                    for m in deps:
+                        log.error('  - %s', m)
+                    raise RuntimeError(
+                        'Faltan dependencias para captura Wayland (ver logs)'
+                    )
+                mode = os.environ.get('PYVNCS_WAYLAND_CAPTURE', CAPTURE_MODE_MONITORS)
+                return get_instance(capture_mode=mode).grab()
+
             from Xlib import display, X
             dsp = display.Display()
             root = dsp.screen().root
