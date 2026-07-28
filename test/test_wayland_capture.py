@@ -1,3 +1,4 @@
+import os
 import unittest
 from unittest.mock import Mock, patch, MagicMock
 
@@ -190,6 +191,21 @@ class TestWaylandPortalCapture(unittest.TestCase):
         b = get_instance(capture_mode=CAPTURE_MODE_WINDOWS)
         self.assertIsNot(a, b)
         self.assertEqual(b._capture_mode, CAPTURE_MODE_WINDOWS)
+
+    # --- dependency check ---
+
+    def test_check_dependencies_all_present(self):
+        from lib.wayland_portal_capture import check_dependencies
+        with patch.dict(os.environ, {'PYVNCS_SKIP_SYS_CHECK': '1'}):
+            result = check_dependencies()
+        self.assertEqual(result, [])
+
+    def test_check_dependencies_missing_system_cmd(self):
+        from lib.wayland_portal_capture import check_dependencies
+        with patch.dict(os.environ, {'PYVNCS_SKIP_SYS_CHECK': '', 'WAYLAND_DISPLAY': 'wayland-0'}):
+            with patch('lib.wayland_portal_capture._which', return_value=False):
+                result = check_dependencies()
+        self.assertTrue(any('pipewire' in m for m in result))
 
     # --- _on_new_sample ---
 

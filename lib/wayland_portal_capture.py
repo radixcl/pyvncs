@@ -15,6 +15,74 @@ from lib import log
 
 __all__ = ['WaylandPortalCapture', 'get_instance']
 
+
+def check_dependencies():
+    """Verifica dependencias Python y del sistema para captura Wayland.
+
+    Retorna una lista de mensajes de error vacia si todo esta OK,
+    o con descripciones de lo que falta.
+    """
+    missing = []
+
+    # --- Python packages ---
+    try:
+        import dbus  # noqa: F401
+    except ImportError:
+        missing.append('dbus-python (pip install dbus-python)')
+    try:
+        import gi  # noqa: F401
+    except ImportError:
+        missing.append('PyGObject (pip install PyGObject)')
+    try:
+        import numpy  # noqa: F401
+    except ImportError:
+        missing.append('numpy (pip install numpy)')
+
+    # GStreamer se verifica despues de importar gi
+    _gi_ok = False
+    try:
+        import gi as _gi_mod  # noqa: F401
+        _gi_ok = True
+    except ImportError:
+        missing.append('PyGObject (pip install PyGObject)')
+    if _gi_ok:
+        try:
+            gi.require_version('Gst', '1.0')
+            from gi.repository import Gst  # noqa: F401
+        except (ImportError, KeyError):
+            missing.append(
+                'gstreamer1.0 + gir1.2-gst-1.0 (pip install PyGObject; '
+                'system: gstreamer1.0-plugins-base, gir1.2-gst-1.0)'
+            )
+
+    # --- System binaries / portals ---
+    for cmd in ('pipewire', 'xdg-desktop-portal', 'gdbus'):
+        if not os.environ.get('PYVNCS_SKIP_SYS_CHECK') and not _which(cmd):
+            missing.append(
+                '%s (system package: pipewire, xdg-desktop-portal, dbus-x11)' % cmd
+            )
+
+    # Portal ScreenCast availability (requires running session)
+    if not missing and os.environ.get('WAYLAND_DISPLAY'):
+        try:
+            bus = dbus.SessionBus()
+            bus.get_object(PORTAL_BUS_NAME, PORTAL_OBJECT_PATH)
+        except Exception:
+            missing.append(
+                'xdg-desktop-portal no responde en esta sesion (ejecuta: '
+                'systemctl --user start xdg-desktop-portal)'
+            )
+
+    return missing
+
+
+def _which(cmd):
+    try:
+        import shutil
+        return shutil.which(cmd) is not None
+    except Exception:
+        return False
+
 PORTAL_BUS_NAME = 'org.freedesktop.portal.Desktop'
 PORTAL_OBJECT_PATH = '/org/freedesktop/portal/desktop'
 SCREENCAST_IFACE = 'org.freedesktop.portal.ScreenCast'
