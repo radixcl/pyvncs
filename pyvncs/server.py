@@ -581,7 +581,7 @@ class VNCServer():
         
         del scr
 
-        crop = img.crop((x, y, w, h))
+        crop = img.crop((x, y, x + w, y + h))
         del img
         
         return crop
@@ -631,6 +631,7 @@ class VNCServer():
         # send FramebufferUpdate to client
         rectangle = self.get_rectangle(x, y, w, h)
         if not rectangle:
+            log.debug(f"send_rectangles: get_rectangle returned falsy for ({x},{y},{w},{h})")
             rectangle = Image.new("RGB", [w, h], (0,0,0))
 
         lastshot = rectangle
@@ -701,6 +702,7 @@ class VNCServer():
                         self._process_pending_input(sock, peek, self._mouse_controller, self._kbd_controller, self._clipboard_controller)
                 except (BlockingIOError, OSError):
                     pass
+            log.debug(f"send_rectangles: sent {sent} bytes for ({x},{y},{w},{h})")
         except Exception as e:
             log.debug(f"Error sending changes: {str(e)}")
             return False

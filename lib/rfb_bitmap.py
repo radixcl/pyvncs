@@ -32,9 +32,9 @@ class RfbBitmap():
             # primaryOrder controls channel order for the encoder
             # rgb = encoder expects RGB, bgr = encoder expects BGR
             if self.primaryOrder == "bgr":
-                (b, g, r) = image.split()
+                (r, g, b) = image.split()
                 image = Image.merge("RGB", (b, g, r))
-                del b, g, r
+                del r, g, b
 
             return image
 
@@ -46,16 +46,16 @@ class RfbBitmap():
                 del r, g, b, a
 
             if self.primaryOrder == "bgr":
-                (b, g, r) = image.split()
+                (r, g, b) = image.split()
                 image = Image.merge("RGB", (b, g, r))
-                del b, g, r
+                del r, g, b
 
             return image
 
         elif self.bpp == 8:
             image = rectangle.convert('RGB')
             if self.primaryOrder == "bgr":
-                (b, g, r) = image.split()
+                (r, g, b) = image.split()
                 image = Image.merge("RGB", (b, g, r))
                 del b, g, r
 
