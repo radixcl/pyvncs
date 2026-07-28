@@ -89,14 +89,17 @@ class TestClipboardController(unittest.TestCase):
         result = ctrl.client_cut_text(sock)
         self.assertEqual(result, "test")
 
-    @patch('sys.platform', 'linux')
-    @patch('subprocess.run')
-    def test_get_server_clipboard_xclip(self, mock_run):
+    @patch('lib.clipboardctrl._GTK_AVAILABLE', True)
+    def test_get_server_clipboard_native(self):
         from lib.clipboardctrl import ClipboardController
-        mock_run.return_value = Mock(returncode=0, stdout="clipboard content\n")
-        ctrl = ClipboardController()
-        result = ctrl.get_server_clipboard()
-        self.assertEqual(result, "clipboard content")
+        mock_cb = Mock()
+        mock_cb.wait_for_text.return_value = "clipboard content"
+        mock_d = Mock()
+        with patch('gi.repository.Gdk.Display.get_default', return_value=mock_d), \
+             patch('gi.repository.Gtk.Clipboard.get_for_display', return_value=mock_cb):
+            ctrl = ClipboardController()
+            result = ctrl.get_server_clipboard()
+            self.assertEqual(result, "clipboard content")
 
 
 class TestVeNCrypt(unittest.TestCase):

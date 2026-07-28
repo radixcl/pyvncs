@@ -1,9 +1,16 @@
 from struct import *
-import subprocess
 import sys
 import threading
-import time
 from lib import log
+
+try:
+    import gi
+    gi.require_version('Gtk', '3.0')
+    from gi.repository import Gtk, Gdk
+    _GTK_AVAILABLE = True
+except ImportError:
+    _GTK_AVAILABLE = False
+
 
 class ClipboardController():
 
@@ -39,7 +46,7 @@ class ClipboardController():
         return self._last_clipboard
 
     def get_server_clipboard(self):
-        """Read the system clipboard content."""
+        """Read the system clipboard content natively."""
         try:
             if sys.platform == 'win32':
                 import tkinter as tk
@@ -49,23 +56,21 @@ class ClipboardController():
                 root.destroy()
                 return text
             elif sys.platform == 'darwin':
+                import subprocess
                 result = subprocess.run(
                     ['pbpaste'], capture_output=True, text=True, timeout=2
                 )
                 return result.stdout.strip()
+            elif _GTK_AVAILABLE:
+                d = Gdk.Display.get_default()
+                if d is None:
+                    return None
+                atom = Gdk.atom_intern('CLIPBOARD', False)
+                cb = Gtk.Clipboard.get_for_display(d, atom)
+                text = cb.wait_for_text()
+                return text
             else:
-                # Linux/Unix: try xclip first, then wl-copy, then xsel
-                for cmd in [['xclip', '-selection', 'clipboard', '-o'],
-                            ['wl-paste', '--no-newline'],
-                            ['xsel', '--clipboard', '--output']]:
-                    try:
-                        result = subprocess.run(
-                            cmd, capture_output=True, text=True, timeout=2
-                        )
-                        if result.returncode == 0:
-                            return result.stdout.strip()
-                    except (subprocess.TimeoutExpired, FileNotFoundError):
-                        continue
+                return None
         except Exception as e:
             log.debug("Error reading server clipboard:", str(e))
         return None
@@ -77,7 +82,7 @@ class ClipboardController():
 
         try:
             server_text = self.get_server_clipboard()
-            if server_text is None:
+            if server_text is None or server_text == '':
                 return False
 
             if server_text == current:
