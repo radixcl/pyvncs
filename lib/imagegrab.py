@@ -74,7 +74,7 @@ class ImageGrab():
                     if deps:
                         log.error('Dependencias faltantes para captura Wayland:')
                         for m in deps:
-                            log.error('  - %s', m)
+                            log.error('  - ' + m)
                         raise RuntimeError(
                             'Faltan dependencias para captura Wayland (ver logs)'
                         )
