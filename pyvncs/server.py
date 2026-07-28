@@ -469,6 +469,14 @@ class VNCServer():
                 if self.cursor_support:
                     self.send_cursor(x, y)
 
+                # Drain any input that arrived while we were sending
+                try:
+                    extra = sock.recv(4096)
+                    if extra:
+                        self._process_pending_input(sock, extra, mousecontroller, kbdcontroller, clipboardcontroller)
+                except (BlockingIOError, OSError):
+                    pass
+
                 # Update bandwidth estimator with what was just sent
                 self._bw_estimator.record_send(self._last_sent_bytes)
                 # Adjust rate limit based on throughput
@@ -497,7 +505,7 @@ class VNCServer():
             if data[0] == 5:    # PointerEvent
                 x, y, _ = mousecontroller.process_event(sock.recv(5, socket.MSG_WAITALL))
                 continue
-            
+
             if data[0] == 6:    # ClientCutText
                 text = clipboardcontroller.client_cut_text(sock)
                 log.debug("ClientCutText:", text)
@@ -511,7 +519,57 @@ class VNCServer():
             if now - last_clipboard_sync >= clipboardcontroller.sync_interval:
                 last_clipboard_sync = now
                 clipboardcontroller.maybe_send_clipboard(sock)
-            
+
+    def _process_pending_input(self, sock, data, mousecontroller, kbdcontroller, clipboardcontroller):
+        """Parse and dispatch any pending RFB input messages from *data*."""
+        buf = data
+        while len(buf) >= 1:
+            msg_type = buf[0]
+            needed = 0
+            if msg_type == 0:   # SetPixelFormat
+                needed = 20
+            elif msg_type == 2: # SetEncoding
+                if len(buf) < 3:
+                    break
+                (nenc,) = unpack("!xH", buf[:3])
+                needed = 3 + 4 * nenc
+            elif msg_type == 3: # FBUpdateRequest
+                needed = 9
+            elif msg_type == 4: # keyboard
+                needed = 7
+            elif msg_type == 5: # PointerEvent
+                needed = 5
+            elif msg_type == 6: # ClientCutText
+                if len(buf) < 4:
+                    break
+                (ln,) = unpack("!I", buf[1:5])
+                needed = 4 + ln
+            else:
+                # Unknown — skip one byte to avoid infinite loop
+                buf = buf[1:]
+                continue
+
+            if len(buf) < needed:
+                break
+            chunk = buf[:needed]
+            buf = buf[needed:]
+
+            if msg_type == 4:
+                try:
+                    kbdcontroller.process_event(chunk)
+                except Exception:
+                    pass
+            elif msg_type == 5:
+                try:
+                    mousecontroller.process_event(chunk)
+                except Exception:
+                    pass
+            elif msg_type == 6:
+                try:
+                    clipboardcontroller.client_cut_text_from_chunk(chunk)
+                except Exception:
+                    pass
+
     def get_rectangle(self, x, y, w, h):
         try:
             scr = ImageGrab.grab()
@@ -630,10 +688,24 @@ class VNCServer():
             log.debug("[!] Unsupported BPP: %s" % self.bpp)
 
         self.framebuffer = lastshot
+
+        # Chunked send with input draining to keep keyboard/mouse responsive
         try:
-            sock.sendall(sendbuff)
+            sent = 0
+            total = len(sendbuff)
+            CHUNK = 65536
+            while sent < total:
+                chunk = sendbuff[sent:sent + CHUNK]
+                n = sock.send(chunk)
+                sent += n
+                # Drain any pending input that arrived while we were sending
+                try:
+                    peek = sock.recv(4096)
+                    if peek:
+                        self._process_pending_input(sock, peek, mousecontroller, kbdcontroller, clipboardcontroller)
+                except (BlockingIOError, OSError):
+                    pass
         except Exception as e:
-            # connection closed?
             log.debug(f"Error sending changes: {str(e)}")
             return False
 
