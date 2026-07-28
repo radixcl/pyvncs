@@ -1,5 +1,6 @@
 import os
 import threading
+import time
 import uuid
 
 import dbus
@@ -18,12 +19,19 @@ PORTAL_BUS_NAME = 'org.freedesktop.portal.Desktop'
 PORTAL_OBJECT_PATH = '/org/freedesktop/portal/desktop'
 SCREENCAST_IFACE = 'org.freedesktop.portal.ScreenCast'
 REQUEST_IFACE = 'org.freedesktop.portal.Request'
+SESSION_IFACE = 'org.freedesktop.portal.Session'
 
 SOURCE_TYPE_MONITOR = 1
+SOURCE_TYPE_WINDOW = 2
 CURSOR_MODE_HIDDEN = 1
 PERSIST_MODE_UNTIL_REVOKED = 2
 
 FIRST_FRAME_TIMEOUT = 90
+MAX_RECONNECT_ATTEMPTS = 5
+RECONNECT_DELAY = 2.0
+
+CAPTURE_MODE_MONITORS = 'monitors'
+CAPTURE_MODE_WINDOWS = 'windows'
 
 
 def _config_dir():
@@ -52,13 +60,31 @@ def _save_restore_token(token):
     os.chmod(path, 0o600)
 
 
-class WaylandPortalCapture():
-    """Captura de pantalla en Wayland (GNOME/KDE) via xdg-desktop-portal ScreenCast + PipeWire."""
+def _pick_best_stream(streams):
+    """Selecciona el mejor stream de una lista (mayor resolución primero)."""
+    if len(streams) == 1:
+        return streams[0]
+    def _resolution(s):
+        props = s[1] if len(s) > 1 else {}
+        width = props.get('width', 0) or 0
+        height = props.get('height', 0) or 0
+        return width * height
+    return max(streams, key=_resolution)
 
-    def __init__(self):
+
+class WaylandPortalCapture():
+    """Captura de pantalla en Wayland (GNOME/KDE) via xdg-desktop-portal ScreenCast + PipeWire.
+
+    Soporta multi-monitor y captura de ventanas individuales.
+    Incluye reconexión automática ante caída del stream o revocación del portal.
+    """
+
+    def __init__(self, capture_mode=CAPTURE_MODE_MONITORS):
+        self._capture_mode = capture_mode
         self._lock = threading.Lock()
         self._start_lock = threading.Lock()
         self._started = False
+        self._stopping = False
         self._frame = None
         self._error = None
         self._first_frame_event = threading.Event()
@@ -66,6 +92,8 @@ class WaylandPortalCapture():
         self._screencast = None
         self._session_handle = None
         self._pipeline = None
+        self._main_loop = None
+        self._reconnect_attempts = 0
 
     def grab(self):
         self._ensure_started()
@@ -82,6 +110,25 @@ class WaylandPortalCapture():
             if self._frame is None:
                 raise RuntimeError('No se pudo obtener un frame de la captura Wayland')
             return self._frame.copy()
+
+    def stop(self):
+        """Detiene la captura y libera recursos."""
+        with self._start_lock:
+            self._stopping = True
+            if self._pipeline is not None:
+                try:
+                    self._pipeline.set_state(Gst.State.NULL)
+                except Exception:
+                    pass
+                self._pipeline = None
+            if self._main_loop is not None:
+                try:
+                    self._main_loop.quit()
+                except Exception:
+                    pass
+                self._main_loop = None
+            self._started = False
+            self._reconnect_attempts = 0
 
     def _ensure_started(self):
         with self._start_lock:
@@ -104,8 +151,9 @@ class WaylandPortalCapture():
             self._bus = dbus.SessionBus()
             portal = self._bus.get_object(PORTAL_BUS_NAME, PORTAL_OBJECT_PATH)
             self._screencast = dbus.Interface(portal, SCREENCAST_IFACE)
+            self._main_loop = GLib.MainLoop()
             self._create_session()
-            GLib.MainLoop().run()
+            self._main_loop.run()
         except Exception as e:
             self._fail(e)
 
@@ -141,14 +189,29 @@ class WaylandPortalCapture():
 
     def _on_session_created(self, results):
         self._session_handle = results['session_handle']
+        # Escuchar revocación del portal
+        try:
+            self._bus.add_signal_receiver(
+                self._on_portal_revoked,
+                signal_name='Closed',
+                dbus_interface=SESSION_IFACE,
+                path=self._session_handle,
+                bus_name=PORTAL_BUS_NAME,
+            )
+        except Exception:
+            pass
         self._select_sources()
 
     def _select_sources(self):
         token = self._subscribe_request(self._on_sources_selected)
+        if self._capture_mode == CAPTURE_MODE_WINDOWS:
+            source_types = SOURCE_TYPE_WINDOW
+        else:
+            source_types = SOURCE_TYPE_MONITOR
         options = {
             'handle_token': token,
-            'types': dbus.UInt32(SOURCE_TYPE_MONITOR),
-            'multiple': False,
+            'types': dbus.UInt32(source_types),
+            'multiple': True,
             'cursor_mode': dbus.UInt32(CURSOR_MODE_HIDDEN),
             'persist_mode': dbus.UInt32(PERSIST_MODE_UNTIL_REVOKED),
         }
@@ -169,11 +232,38 @@ class WaylandPortalCapture():
         if not streams:
             self._fail(RuntimeError('El portal no devolvio ningun stream de captura'))
             return
-        node_id, _props = streams[0]
+        node_id, _props = _pick_best_stream(streams)
         new_token = results.get('restore_token')
         if new_token:
             _save_restore_token(str(new_token))
+        self._reconnect_attempts = 0
         self._open_pipewire_remote(int(node_id))
+
+    def _on_portal_revoked(self):
+        log.warning('El portal revoco el stream de captura, intentando reconectar...')
+        self._attempt_reconnect()
+
+    def _attempt_reconnect(self):
+        if self._reconnect_attempts >= MAX_RECONNECT_ATTEMPTS:
+            self._fail(RuntimeError(
+                'No se pudo reconectar despues de %d intentos' % MAX_RECONNECT_ATTEMPTS
+            ))
+            return
+        self._reconnect_attempts += 1
+        log.info('Reconectando al portal (intento %d/%d)...', self._reconnect_attempts, MAX_RECONNECT_ATTEMPTS)
+        time.sleep(RECONNECT_DELAY)
+        try:
+            if self._pipeline is not None:
+                self._pipeline.set_state(Gst.State.NULL)
+                self._pipeline = None
+            self._start()
+        except Exception as e:
+            log.error('Error en reconexion: %s', e)
+            self._attempt_reconnect()
+
+    def _on_pipeline_eos(self, _bus, message):
+        log.warning('PipeWire stream termino (EOS), intentando reconectar...')
+        self._attempt_reconnect()
 
     def _open_pipewire_remote(self, node_id):
         fd_object = self._screencast.OpenPipeWireRemote(self._session_handle, {})
@@ -193,12 +283,14 @@ class WaylandPortalCapture():
         bus = self._pipeline.get_bus()
         bus.add_signal_watch()
         bus.connect('message::error', self._on_gst_error)
+        bus.connect('message::eos', self._on_pipeline_eos)
 
         self._pipeline.set_state(Gst.State.PLAYING)
 
     def _on_gst_error(self, _bus, message):
         err, debug = message.parse_error()
-        self._fail(RuntimeError('Error de GStreamer: %s (%s)' % (err, debug)))
+        log.error('Error de GStreamer: %s (%s)', err, debug)
+        self._attempt_reconnect()
 
     def _on_new_sample(self, sink):
         sample = sink.emit('pull-sample')
@@ -232,9 +324,12 @@ _instance = None
 _instance_lock = threading.Lock()
 
 
-def get_instance():
+def get_instance(capture_mode=CAPTURE_MODE_MONITORS):
     global _instance
     with _instance_lock:
-        if _instance is None:
-            _instance = WaylandPortalCapture()
+        if _instance is None or _instance._capture_mode != capture_mode:
+            old = _instance
+            _instance = WaylandPortalCapture(capture_mode=capture_mode)
+            if old is not None:
+                old.stop()
         return _instance

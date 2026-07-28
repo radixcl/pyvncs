@@ -5,3 +5,11 @@ Pillow-PIL
 elevate
 PyGObject; sys_platform == "linux"
 dbus-python; sys_platform == "linux"
+
+# Dependencias del sistema requeridas para Wayland (no se instalan con pip):
+#   gst-plugins-base-1.0   (appsink, videoconvert)
+#   gst-plugins-good-1.0   (elements usados en el pipeline)
+#   gst-plugins-bad-1.0    (pipewiresrc)
+#   pipewire               (daemon y sockets)
+#   xdg-desktop-portal     (ScreenCast portal)
+#   xdg-desktop-portal-gnome o xdg-desktop-portal-kde

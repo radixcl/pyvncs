@@ -8,8 +8,9 @@ class ImageGrab():
     def grab():
         if sys.platform == "linux" or sys.platform == "linux2":
             if os.environ.get("WAYLAND_DISPLAY"):
-                from lib.wayland_portal_capture import get_instance
-                return get_instance().grab()
+                from lib.wayland_portal_capture import get_instance, CAPTURE_MODE_MONITORS
+                mode = os.environ.get('PYVNCS_WAYLAND_CAPTURE', CAPTURE_MODE_MONITORS)
+                return get_instance(capture_mode=mode).grab()
 
             from Xlib import display, X
             dsp = display.Display()
