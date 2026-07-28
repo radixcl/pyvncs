@@ -21,17 +21,8 @@ class RfbBitmap():
         a = np.asarray(rectangle).copy()
 
         if self.bpp == 32:
-            redBits = 8
-            greenBits = 8
-            blueBits = 8
-
-            redMask = ((1 << redBits) - 1) << self.red_shift
-            greenMask = ((1 << greenBits) - 1) << self.green_shift
-            blueMask = ((1 << blueBits) - 1) << self.blue_shift
-            a[..., 0] = (a[..., 0] & redMask) >> self.red_shift
-            a[..., 1] = (a[..., 1] & greenMask) >> self.green_shift
-            a[..., 2] = (a[..., 2] & blueMask) >> self.blue_shift
-
+            # Input is an RGB (H,W,3) array; just copy channels as-is.
+            # Bitmask/shift logic below only applies to pre-packed XRGB arrays.
             image = Image.fromarray(a)
             if image.mode == "RGBA":
                 (r, g, b, a) = image.split()
