@@ -33,6 +33,44 @@ from lib.imagegrab import ImageGrab
 from lib.rfb_bitmap import RfbBitmap
 from lib import log
 
+
+class _BandwidthEstimator:
+    """Exponential moving average bandwidth estimator for adaptive rate limiting."""
+
+    def __init__(self, alpha=0.3, window=20):
+        self.alpha = alpha
+        self.window = window
+        self._samples = []
+        self._bytes_total = 0
+        self._last_time = None
+        self.current_bps = 0.0
+
+    def record_send(self, n_bytes):
+        now = time.time()
+        self._bytes_total += n_bytes
+
+        if self._last_time is not None:
+            dt = now - self._last_time
+            if dt > 0:
+                bps = n_bytes * 8 / dt
+                self._samples.append(bps)
+                if len(self._samples) > self.window:
+                    self._samples.pop(0)
+                # EMA smoothing
+                self.current_bps = (
+                    self.alpha * bps + (1 - self.alpha) * self.current_bps
+                    if self._last_time is not None else bps
+                )
+
+        self._last_time = now
+
+    def reset(self):
+        self._samples = []
+        self._bytes_total = 0
+        self._last_time = None
+        self.current_bps = 0.0
+
+
 # encodings support
 import lib.encodings as encs
 from lib.encodings.common import ENCODINGS
@@ -63,7 +101,12 @@ class VNCServer():
         self.pem_file = pem_file
         self.vnc_config = vnc_config
         self.cursor_encoding = CursorEncoding()
-        self.fbupdate_rate_limit = 0.05
+
+        # Adaptive rate limiting: start conservative, adjust based on throughput
+        self.fbupdate_min_interval = 0.02    # hard floor (50 fps max)
+        self.fbupdate_max_interval = 0.20   # ceiling for slow links
+        self.fbupdate_rate_limit = 0.05     # initial interval (20 fps)
+        self._bw_estimator = _BandwidthEstimator()
 
         log.debug("Configured auth type:", self.auth_type)
 
@@ -253,8 +296,7 @@ class VNCServer():
 
     def handle_client(self):
         self.socket.settimeout(None)    # set nonblocking socket
-        last_fbur = time.time()
-        
+
         mousecontroller = mousectrl.MouseController()
         kbdcontroller = kbdctrl.KeyboardController()
         clipboardcontroller = clipboardctrl.ClipboardController()
@@ -264,6 +306,9 @@ class VNCServer():
         self.encoding_object = encs.common.encodings[self.encoding]()
 
         sock = self.socket
+        last_fbur = time.time()
+        last_clipboard_sync = 0.0
+
         while True:
 
             try:
@@ -360,26 +405,45 @@ class VNCServer():
 
 
             if data[0] == 3: # FBUpdateRequest
-                # rate limit
+                # rate limit (adaptive)
                 fbur_data = sock.recv(9, socket.MSG_WAITALL)
                 if not fbur_data:
                     log.debug("connection closed?")
                     break
-                if time.time() - last_fbur < self.fbupdate_rate_limit:
-                    # rate limited
-                    try: 
+                elapsed = time.time() - last_fbur
+                if elapsed < self.fbupdate_rate_limit:
+                    # rate limited — send empty update and let estimator run
+                    try:
                         sock.sendall(pack("!BxH", 0, 0))
                     except Exception as e:
                         log.debug(f"Error sending rate limited FBUpdateRequest: {str(e)}")
                         break
                     continue
-                
+
                 last_fbur = time.time()
                 (incremental, x, y, w, h) = unpack("!BHHHH", fbur_data)
-                #log.debug("RFBU:", incremental, x, y, w, h)
                 self.send_rectangles(sock, x, y, w, h, incremental)
                 if self.cursor_support:
                     self.send_cursor(x, y)
+
+                # Update bandwidth estimator with what was just sent
+                self._bw_estimator.record_send(self._last_sent_bytes)
+                # Adjust rate limit based on throughput
+                bps = self._bw_estimator.current_bps
+                if bps > 0:
+                    frame_budget = (bps * self.fbupdate_rate_limit) / 8
+                    # If we're well under the budget, speed up; else slow down
+                    ratio = self._last_sent_bytes / max(frame_budget, 1)
+                    if ratio < 0.5:
+                        self.fbupdate_rate_limit = max(
+                            self.fbupdate_min_interval,
+                            self.fbupdate_rate_limit * 0.9
+                        )
+                    elif ratio > 1.5:
+                        self.fbupdate_rate_limit = min(
+                            self.fbupdate_max_interval,
+                            self.fbupdate_rate_limit * 1.1
+                        )
                 continue
                 
 
@@ -398,6 +462,12 @@ class VNCServer():
             else:
                 fbur_data = sock.recv(4096)
                 log.debug("RAW Server received data:", repr(data[0]) , data+fbur_data)
+
+            # Periodic clipboard sync (server -> client)
+            now = time.time()
+            if now - last_clipboard_sync >= clipboardcontroller.sync_interval:
+                last_clipboard_sync = now
+                clipboardcontroller.maybe_send_clipboard(sock)
             
     def get_rectangle(self, x, y, w, h):
         try:
@@ -523,3 +593,5 @@ class VNCServer():
             # connection closed?
             log.debug(f"Error sending changes: {str(e)}")
             return False
+
+        self._last_sent_bytes = len(sendbuff)
