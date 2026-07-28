@@ -181,6 +181,9 @@ class VNCServer():
 
         log.debug("sec type data: %s" % data)
 
+        # Working socket - may be replaced by SSL socket after VeNCrypt TLS
+        working_sock = sock
+
         # VNC Auth
         if sectype == self.RFB_SECTYPES.vncauth:
             auth = VNCAuth()
@@ -195,48 +198,76 @@ class VNCServer():
 
         # VeNCrypt
         elif sectype == self.RFB_SECTYPES.vencrypt:
-            userlist = {}
-            try:
-                userlist[self.password.split(':')[0]] = self.password.split(':')[1]
-            except Exception as ex:
-                log.debug("Unable to parse username:password combination.\n%s" % ex)
-                sock.close()
-                return False
+            # Parse credentials: "password" for Plain, "user:pass" for TLSPlain
+            if ':' in self.password:
+                default_user, default_pass = self.password.split(':', 1)
+            else:
+                default_user = 'user'
+                default_pass = self.password
+
+            userlist = {
+                default_user: default_pass
+            }
+
+            # Also parse additional users if password has multiple user:pass entries
+            # separated by semicolons: "user1:pass1;user2:pass2"
+            if ';' in self.password:
+                userlist = {}
+                for entry in self.password.split(';'):
+                    if ':' in entry:
+                        u, p = entry.split(':', 1)
+                        userlist[u] = p
 
             auth = VeNCrypt(sock)
             auth.getbuff = self.get_buffer
+            auth.pem_file = self.pem_file
             auth.send_subtypes()
             client_subtype = auth.client_subtype
 
-            if client_subtype == 256: # Vencrypt Plain auth
+            if client_subtype == VeNCrypt.SUBTYPE_PLAIN:
+                # Plain auth without TLS encryption
+                log.debug(__name__, "Using VeNCrypt Plain auth (no TLS)")
                 if not auth.auth_plain(userlist):
                     sock.close()
                     return False
 
-            if client_subtype == 259: # Vencrypt TLSPlain auth
-                auth.pem_file = self.pem_file
-                auth.socket = self.socket
+            elif client_subtype == VeNCrypt.SUBTYPE_TLSPLAIN:
+                # TLS encrypted channel + Plain auth
+                log.debug(__name__, "Using VeNCrypt TLS+Plain auth")
                 if not auth.auth_tls_plain(userlist):
                     sock.close()
                     return False
+                # After TLS, all communication goes through the SSL socket
+                working_sock = auth.get_socket()
 
             else:
                 # unsupported subtype
-                log.debug("Unsuported client_subtype", client_subtype)
-                sock.close()
+                log.debug("Unsupported client_subtype:", client_subtype)
+                sendbuff = pack("!I", 1)
+                working_sock.sendall(sendbuff)
+                working_sock.close()
                 return False
-        
-        #elif sectype == self.RFB_SECTYPES.unix:
-        #    log.debug("UNIX!!")
 
-        #unsupported VNC auth type
+            # Store auth object for socket access
+            self.vencrypt_auth = auth
+
         else:
             log.debug("Unsupported auth type")
             sock.close()
             return False
 
-        # get ClientInit
-        data = self.get_buffer(30)
+        # Replace working socket if VeNCrypt TLS was used
+        self.socket = working_sock
+
+        # Get ClientInit
+        working_sock.settimeout(30)
+        data = working_sock.recv(1)
+        if not data:
+            log.debug("Connection closed during ClientInit")
+            working_sock.close()
+            return False
+        # Remaining 3 bytes of padding are consumed by SetPixelFormat handler
+
         log.debug("Clientinit (shared flag)", repr(data))
 
         self.server_init()
@@ -304,6 +335,7 @@ class VNCServer():
         self.primaryOrder = "bgr"
         self.encoding = ENCODINGS.raw
         self.encoding_object = encs.common.encodings[self.encoding]()
+
 
         sock = self.socket
         last_fbur = time.time()
@@ -386,10 +418,14 @@ class VNCServer():
 
                 # which pixel encoding to use?
                 log.debug("encs.common.encodings_priority", encs.common.encodings_priority)
+                selected = False
                 for e in encs.common.encodings_priority:
+                    if e not in encs.common.encodings:
+                        continue
                     if e in self.client_encodings:
                         if self.encoding == e:
                             # don't initialize same encoding again
+                            selected = True
                             break
                         # check if encoding is disabled
                         if not encs.common.encodings[e].enabled:
@@ -399,7 +435,14 @@ class VNCServer():
                         #log.debug("Using %s encoding" % self.encoding)
                         log.debug("Using %s encoding" % encs.common.encodings[self.encoding].name)
                         self.encoding_object = encs.common.encodings[self.encoding]()
+                        selected = True
                         break
+
+                if not selected:
+                    log.debug("No matching encoding found, falling back to raw (0)")
+                    log.debug("Client encodings:", self.client_encodings)
+                    if 0 not in self.client_encodings:
+                        log.error("Client does not support raw encoding (0) - connection may fail")
 
                 continue
 
@@ -582,7 +625,7 @@ class VNCServer():
 
             # send image with client defined encoding
             self.encoding_object.framebuffer = self.framebuffer
-            sendbuff.extend(self.encoding_object.send_image(x, y, w, h, image))
+            sendbuff.extend(self.encoding_object.send_image(x, y, w, h, image, self.bpp, self.depth))
         else:
             log.debug("[!] Unsupported BPP: %s" % self.bpp)
 

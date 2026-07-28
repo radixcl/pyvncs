@@ -15,11 +15,21 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program. If not, see <http://www.gnu.org/licenses/>.
 
+import os
+
+# Disabled encodings: comma-separated list (e.g. "hextile,tight")
+_DISABLED_ENCODINGS = os.environ.get('PYVNCS_DISABLED_ENCODINGS', '').lower().split(',')
+_DISABLED_ENCODINGS = [e.strip() for e in _DISABLED_ENCODINGS if e.strip()]
+
 # at least, raw encoding is needed by the rfb protocol    
 from . import common
-from . import raw
-from . import zlib
+if 'raw' not in _DISABLED_ENCODINGS:
+    from . import raw
+if 'zlib' not in _DISABLED_ENCODINGS:
+    from . import zlib
 #from . import zrle
-from . import tight
-from . import hextile
+if 'tight' not in _DISABLED_ENCODINGS:
+    from . import tight
+if 'hextile' not in _DISABLED_ENCODINGS:
+    from . import hextile
 from . import cursor

@@ -21,6 +21,7 @@ from lib import log
 
 class Encoding:
     _buff = None
+    framebuffer = None
 
     name = 'raw'
     id = 0
@@ -31,13 +32,39 @@ class Encoding:
     def __init__(self):
         log.debug("Initialized", __name__)
 
-    def send_image(self, x, y, w, h, image):
+    def send_image(self, x, y, w, h, image, bpp=32, depth=24):
         self._buff = bytearray()
         rectangles = 1
-        self._buff.extend(pack("!BxH", 0, rectangles))  # message type 0 == FramebufferUpdate
+        self._buff.extend(pack("!BxH", 0, rectangles))
         self._buff.extend(pack("!HHHH", x, y, w, h))
         self._buff.extend(pack(">i", self.id))
-        self._buff.extend( image.tobytes() )
+
+        img_data = image.tobytes()
+
+        if bpp == 16:
+            # Client expects BGR565: (B<<11)|(G<<5)|R
+            raw = bytearray()
+            for i in range(0, len(img_data), 3):
+                if i + 2 < len(img_data):
+                    r, g, b = img_data[i], img_data[i+1], img_data[i+2]
+                    rr = (r >> 3) & 0x1F
+                    gg = (g >> 2) & 0x3F
+                    bb = (b >> 3) & 0x1F
+                    pixel = (bb << 11) | (gg << 5) | rr
+                    raw.extend(pack("<H", pixel))
+            self._buff.extend(raw)
+
+        elif bpp == 32:
+            # Client expects BGRX
+            raw = bytearray()
+            for i in range(0, len(img_data), 3):
+                if i + 2 < len(img_data):
+                    r, g, b = img_data[i], img_data[i+1], img_data[i+2]
+                    raw.extend(pack("<I", (b << 16) | (g << 8) | r))
+            self._buff.extend(raw)
+
+        else:
+            self._buff.extend(img_data)
 
         return self._buff
 

@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-import pyvncs
 from argparse import ArgumentParser
 from threading import Thread
 from time import sleep
 import sys
+import os
 import socket
 import ssl
 import signal
@@ -53,31 +53,68 @@ def main(argv):
     class vnc_config:
         pass
 
-    parser = ArgumentParser()
+    parser = ArgumentParser(description="PyVNCs - Multiplatform Python VNC Server")
     parser.add_argument("-l", "--listen-address", dest="listen_addr",
-                        help="Listen in this address, default: %s" % ("0.0.0.0"), required=False, default='0.0.0.0')
+                        help="Listen in this address, default: 0.0.0.0", required=False, default='0.0.0.0')
     parser.add_argument("-p", "--port", dest="listen_port",
-                        help="Listen in this port, default: %s" % ("5901"), type=int, required=False, default='5901')
+                        help="Listen on this port, default: 5901", required=False, type=int, default=5901)
     parser.add_argument("-A", "--auth-type",
-                        help="Sets VNC authentication type (supported: 2(vnc), 19(vencrypt))",
+                        help="Sets VNC authentication type (2=VNC, 19=VeNCrypt). Default: 2",
                         required=False,
                         type=int,
                         default=2,
                         dest="auth_type"
                         )
+    parser.add_argument("-u", "--username",
+                        help="Sets the VNC username (for VeNCrypt auth). Default: user",
+                        required=False,
+                        type=str,
+                        default='',
+                        dest="vnc_username"
+                        )
+    parser.add_argument("-U", "--users-file",
+                        help="File with multiple users (one user:pass per line) for VeNCrypt",
+                        required=False,
+                        type=str,
+                        default='',
+                        dest="users_file"
+                        )
+    parser.add_argument("-P", "--vncpassword",
+                        help="Sets VNC password. For VeNCrypt: user:pass or user:pass;user2:pass2",
+                        required=True, dest="vnc_password")
     parser.add_argument("-C", "--cert-file",
-                        help="SSL PEM file",
+                        help="SSL PEM certificate file for VeNCrypt TLS. Auto-generated if missing.",
                         required=False,
                         type=str,
                         default='',
                         dest='pem_file'
                         )
-    parser.add_argument("-P", "--vncpassword", help="Sets authentication password", required=True, dest="vnc_password")
-    parser.add_argument("-8", "--8bitdither", help="Enable 8 bit dithering", required=False, action='store_true', dest="dither")
-    parser.add_argument("-O", "--output-file", help="Redirects all debug output to file", required=False, dest="outfile")
-    parser.add_argument("-t", "--title", help="VNC Window title", required=False, dest="win_title", default="pyvncs")
+    parser.add_argument("-8", "--8bitdither",
+                        help="Enable 8-bit color dithering",
+                        required=False,
+                        action='store_true',
+                        dest="dither")
+    parser.add_argument("-O", "--output-file",
+                        help="Redirects all debug output to file",
+                        required=False, dest="outfile")
+    parser.add_argument("-t", "--title",
+                        help="VNC Window title",
+                        required=False, dest="win_title",
+                        default="pyvncs")
+    parser.add_argument("-E", "--disable-encodings",
+                        help="Comma-separated list of encodings to disable "
+                             "(raw, hextile, tight, zlib). Example: -E hextile,zlib",
+                        required=False, dest="disabled_encodings",
+                        default='')
 
     args = parser.parse_args()
+
+    # Set env var BEFORE importing pyvncs (which imports lib.encodings)
+    if args.disabled_encodings:
+        os.environ['PYVNCS_DISABLED_ENCODINGS'] = args.disabled_encodings.lower()
+
+    # Now import pyvncs (encodings will respect the env var)
+    import pyvncs
 
     if args.outfile is not None:
         try:
@@ -87,7 +124,29 @@ def main(argv):
             sys.exit(1)
         sys.stdout = sys.stderr = fsock
 
-    vnc_config.vnc_password = args.vnc_password
+    # Build password string
+    password = args.vnc_password
+
+    # If username provided separately, prepend it
+    if args.vnc_username and ':' not in args.vnc_password:
+        password = args.vnc_username + ':' + args.vnc_password
+
+    # Load users from file if specified
+    if args.users_file:
+        try:
+            users = []
+            with open(args.users_file, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith('#') and ':' in line:
+                        users.append(line)
+            if users:
+                password = ';'.join(users)
+        except Exception as ex:
+            print("Error loading users file:", ex, file=sys.stderr)
+            sys.exit(1)
+
+    vnc_config.vnc_password = password
     vnc_config.eightbitdither = args.dither
     vnc_config.auth_type = args.auth_type
     vnc_config.pem_file = args.pem_file
@@ -97,8 +156,10 @@ def main(argv):
     sockServer.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sockServer.bind((args.listen_addr, args.listen_port))
     
-    _debug("Multithreaded Python server : Waiting for connections from TCP clients...")
-    _debug("Runing on:", sys.platform)
+    auth_name = "VeNCrypt" if args.auth_type == 19 else "VNC"
+    _debug("Starting PyVNCs with %s authentication" % auth_name)
+    _debug("Multithreaded Python server : Waiting for connections on %s:%d..." % (args.listen_addr, args.listen_port))
+    _debug("Running on:", sys.platform)
     # FIXME run_as_admin() is not working on windows
     # if sys.platform in ['win32', 'win64']:
     #     from lib.oshelpers import windows as win32
