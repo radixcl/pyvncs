@@ -65,8 +65,16 @@ def check_dependencies():
     # Portal ScreenCast availability (requires running session)
     if not missing and os.environ.get('WAYLAND_DISPLAY'):
         try:
-            bus = dbus.SessionBus()
-            bus.get_object(PORTAL_BUS_NAME, PORTAL_OBJECT_PATH)
+            import gi
+            gi.require_version('Gtk', '3.0')
+            from gi.repository import GLib, Gio
+            conn = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+            proxy = Gio.DBusProxy.new_sync(
+                conn, 0, None,
+                PORTAL_BUS_NAME, PORTAL_OBJECT_PATH,
+                SCREENCAST_IFACE, None
+            )
+            proxy.get_name()
         except Exception:
             missing.append(
                 'xdg-desktop-portal no responde en esta sesion (ejecuta: '
