@@ -280,14 +280,12 @@ class VNCServer():
 
         sock = self.socket
         screen = ImageGrab.grab()
-        #log.debug("screen", repr(screen))
-        size = screen.size
-        #log.debug("size", repr(size))
+        if isinstance(screen, np.ndarray):
+            height, width = screen.shape[:2]
+        else:
+            width, height = screen.size
         del screen
-        
-        width = size[0]
         self.width = width
-        height = size[1]
         self.height = height
         bpp = 32    # FIXME: get real bpp
         depth = 24  # FIXME: get real depth
@@ -538,26 +536,28 @@ class VNCServer():
 
             # Rate-limit incremental updates only
             if incremental and (time.time() - last_fbur) < self.fbupdate_rate_limit:
-                try:
-                    with self._sock_write_lock:
-                        self.socket.sendall(pack("!BxH", 0, 0))
-                except Exception as e:
-                    log.debug("Error sending rate-limited response: %s" % e)
-                    self._running = False
-                    break
-                continue
+                remaining = self.fbupdate_rate_limit - (time.time() - last_fbur)
+                if remaining > 0:
+                    time.sleep(remaining)
+                last_fbur = time.time()
 
             last_fbur = time.time()
 
             try:
                 with self._sock_write_lock:
                     self.send_rectangles(self.socket, x, y, w, h, incremental)
-                    if self.cursor_support:
-                        self.send_cursor(x, y)
             except Exception as e:
                 log.debug("FB sender error: %s" % e)
                 self._running = False
                 break
+
+            if self.cursor_support:
+                try:
+                    with self._sock_write_lock:
+                        self.send_cursor(x, y)
+                except Exception as e:
+                    log.debug("Cursor send error (disabling): %s" % e)
+                    self.cursor_support = False
 
             # Adaptive rate-limit adjustment
             sent_bytes = getattr(self, '_last_sent_bytes', 0)
@@ -583,18 +583,15 @@ class VNCServer():
         except Exception as ex:
             log.debug("Error grabbing screen: %s" % ex)
             return False
-        (scr_width, scr_height) = scr.size
+
+        if isinstance(scr, np.ndarray):
+            return scr[y:y+h, x:x+w].copy()
 
         if scr.mode != "RGB":
-            img = scr.convert("RGB")
-        else:
-            img = scr
-        
-        del scr
+            scr = scr.convert("RGB")
 
-        crop = img.crop((x, y, x + w, y + h))
-        del img
-        
+        crop = scr.crop((x, y, x + w, y + h))
+        del scr
         return crop
 
     def _encode_cursor_pixels(self, rgb_image):
@@ -683,9 +680,8 @@ class VNCServer():
             return
 
         rectangle = self.get_rectangle(x, y, w, h)
-        if not rectangle:
-            #log.debug("send_rectangles: get_rectangle returned falsy for (%d,%d,%d,%d)" % (x, y, w, h))
-            rectangle = Image.new("RGB", [w, h], (0,0,0))
+        if rectangle is None or (isinstance(rectangle, bool) and not rectangle):
+            rectangle = np.zeros((h, w, 3), dtype=np.uint8)
 
         lastshot = rectangle
         sendbuff = bytearray()
@@ -693,30 +689,33 @@ class VNCServer():
         self.encoding_object.firstUpdateSent = False
         
         # try to send only the actual changes
-        if self.framebuffer != None and incremental == 1:
-            diff = ImageChops.difference(rectangle, self.framebuffer)
-            if diff.getbbox() is None:
-                # no changes...
-                #log.debug("no changes")
-                rectangles = 0
-                sendbuff.extend(pack("!BxH", 0, rectangles))
-                # clear the incoming socket buffer
-                sleep(0.05)
-                try:
-                    sock.sendall(sendbuff)
-                except Exception as e:
-                    log.debug(f"Error sending no changes: {str(e)}")
-                    return False
-                return
-
-            else:
-                if hasattr(diff, "getbbox"):
-                    #log.debug(f"RFB_REQ:", incremental, x, y, w, h)
-                    rectangle = rectangle.crop(diff.getbbox())
-                    (x, y, _, _) = diff.getbbox()
+        if self.framebuffer is not None and incremental == 1:
+            arr_new = np.asarray(rectangle)
+            arr_old = np.asarray(self.framebuffer)
+            if arr_new.shape == arr_old.shape:
+                mask = np.any(arr_new != arr_old, axis=2) if arr_new.ndim == 3 else (arr_new != arr_old)
+                if not mask.any():
+                    rectangles = 0
+                    sendbuff.extend(pack("!BxH", 0, rectangles))
+                    sleep(0.05)
+                    try:
+                        sock.sendall(sendbuff)
+                    except Exception as e:
+                        log.debug(f"Error sending no changes: {str(e)}")
+                        return False
+                    return
+                rows = np.any(mask, axis=1)
+                cols = np.any(mask, axis=0)
+                y0, y1 = np.where(rows)[0][[0, -1]]
+                x0, x1 = np.where(cols)[0][[0, -1]]
+                if isinstance(rectangle, np.ndarray):
+                    rectangle = rectangle[int(y0):int(y1)+1, int(x0):int(x1)+1].copy()
+                    h, w = rectangle.shape[:2]
+                else:
+                    rectangle = rectangle.crop((int(x0), int(y0), int(x1) + 1, int(y1) + 1))
                     w = rectangle.width
                     h = rectangle.height
-                    #log.debug(f"RFB_RES:", incremental, x, y, w, h)
+                x, y = x + int(x0), y + int(y0)
 
         if self.bpp == 32 or self.bpp == 16 or self.bpp == 8:
             bitmap = self.rfb_bitmap
@@ -729,12 +728,18 @@ class VNCServer():
             bitmap.green_shift = self.green_shift
             bitmap.blue_shift = self.blue_shift
 
-            image = bitmap.get_bitmap(rectangle)
-
-            # send image with client defined encoding
             self.encoding_object.framebuffer = self.framebuffer
-            self.encoding_object.primaryOrder = self.primaryOrder
-            sendbuff.extend(self.encoding_object.send_image(x, y, w, h, image, self.bpp, self.depth))
+            if self.encoding == ENCODINGS.tight:
+                self.encoding_object.primaryOrder = 'rgb'
+                if not isinstance(rectangle, np.ndarray):
+                    rectangle = np.asarray(rectangle)
+                sendbuff.extend(self.encoding_object.send_image(x, y, w, h, rectangle, self.bpp, self.depth))
+            else:
+                if isinstance(rectangle, np.ndarray):
+                    rectangle = Image.fromarray(rectangle, 'RGB')
+                image = bitmap.get_bitmap(rectangle)
+                self.encoding_object.primaryOrder = self.primaryOrder
+                sendbuff.extend(self.encoding_object.send_image(x, y, w, h, image, self.bpp, self.depth))
         else:
             log.debug("[!] Unsupported BPP: %s" % self.bpp)
 

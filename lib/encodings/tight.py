@@ -52,12 +52,12 @@ class Encoding:
     def __init__(self):
         log.debug("Initialized", __name__)
         self._streams = [self._new_stream() for _ in range(4)]
-        self._jpeg_quality = 75
+        self._jpeg_quality = 50
 
     @staticmethod
     def _new_stream():
         return zlib.compressobj(
-            zlib.Z_DEFAULT_COMPRESSION, zlib.DEFLATED,
+            1, zlib.DEFLATED,
             zlib.MAX_WBITS, zlib.DEF_MEM_LEVEL, zlib.Z_DEFAULT_STRATEGY)
 
     # Tight decoders (libvncclient, TigerVNC) reject rects wider/taller
@@ -69,14 +69,17 @@ class Encoding:
     # ------------------------------------------------------------------
 
     def send_image(self, x, y, w, h, image, bpp=32, depth=24):
-        # Split into tiles that fit within MAX_RECT
+        arr = np.asarray(image)
+        if arr.ndim == 2:
+            arr = arr.reshape(arr.shape[0], arr.shape[1], 1)
+
         tiles = []
         for ty in range(0, h, self.MAX_RECT):
             th = min(self.MAX_RECT, h - ty)
             for tx in range(0, w, self.MAX_RECT):
                 tw = min(self.MAX_RECT, w - tx)
                 tiles.append((x + tx, y + ty, tw, th,
-                              image.crop((tx, ty, tx + tw, ty + th))))
+                              arr[ty:ty+th, tx:tx+tw]))
 
         sendbuff = bytearray()
         sendbuff.extend(pack("!BxH", 0, len(tiles)))
@@ -88,6 +91,8 @@ class Encoding:
 
         return sendbuff
 
+    _FAST_PATH_PIXELS = 65536
+
     def _encode_tile(self, image, w, h, bpp, depth):
         """Encode a single tile (already ≤ MAX_RECT in each dimension)."""
         tps = self._tpixel_size(bpp, depth)
@@ -95,21 +100,30 @@ class Encoding:
         if arr.ndim == 2:
             arr = arr.reshape(arr.shape[0], arr.shape[1], 1)
 
-        # rfb_bitmap swaps R↔B for "bgr" primaryOrder (needed by raw/zlib
-        # which pack pixels with the client's shift values).  TPIXEL is
-        # always plain RGB per the Tight spec, so undo the swap here.
         if getattr(self, 'primaryOrder', 'rgb') == 'bgr' and arr.shape[2] >= 3:
             arr = arr[:, :, [2, 1, 0]]
 
-        flat = arr.reshape(-1, arr.shape[2])
-        ncol = len(np.unique(flat, axis=0))
-
-        if ncol == 1:
+        if np.all(arr == arr[0, 0]):
             return self._fill(arr, tps)
-        if bpp >= 24 and self._want_jpeg(arr, w, h):
+
+        if w * h >= self._FAST_PATH_PIXELS:
+            if bpp >= 24:
+                return self._jpeg_from_arr(arr)
+            return self._many_colours(arr, tps, bpp, depth)
+
+        flat = arr.reshape(-1, arr.shape[2])
+
+        dt = np.dtype((np.void, flat.shape[1] * flat.dtype.itemsize))
+        flat_s = np.ascontiguousarray(flat).view(dt).ravel()
+        uniq_s, inv = np.unique(flat_s, return_inverse=True)
+        ncol = len(uniq_s)
+
+        if bpp >= 24 and w * h >= 4096 and ncol > 256:
             return self._jpeg_from_arr(arr)
         if ncol <= 256:
-            return self._palette(arr, tps, bpp, depth)
+            uniq = uniq_s.view(flat.dtype).reshape(-1, flat.shape[1])
+            idx = inv.astype(np.uint8).reshape(arr.shape[:2])
+            return self._palette(arr, tps, bpp, depth, uniq=uniq, idx=idx, ncol=ncol)
         return self._many_colours(arr, tps, bpp, depth)
 
     # ------------------------------------------------------------------
@@ -193,43 +207,30 @@ class Encoding:
         return bytes(out)
 
     def _want_jpeg(self, arr, w, h):
-        if w * h < 4096:
-            return False
-        flat = arr.reshape(-1, arr.shape[2])
-        sample = flat[:min(len(flat), 2048)]
-        return len(np.unique(sample, axis=0)) > 96
+        return w * h >= 4096
 
     # ------------------------------------------------------------------
     # filter: palette  (explicit, filter-id 1, stream 1)
     # ------------------------------------------------------------------
 
-    def _palette(self, arr, tps, bpp, depth):
+    def _palette(self, arr, tps, bpp, depth, uniq=None, idx=None, ncol=None):
         h, w = arr.shape[:2]
-        flat = arr.reshape(-1, arr.shape[2])
 
-        # unique colours → palette
-        uniq = np.unique(flat, axis=0)
-        ncol = len(uniq)
+        if uniq is None or idx is None or ncol is None:
+            flat = arr.reshape(-1, arr.shape[2])
+            dt = np.dtype((np.void, flat.shape[1] * flat.dtype.itemsize))
+            flat_s = np.ascontiguousarray(flat).view(dt).ravel()
+            uniq_s, inv = np.unique(flat_s, return_inverse=True)
+            ncol = len(uniq_s)
+            uniq = uniq_s.view(flat.dtype).reshape(-1, flat.shape[1])
+            idx = inv.astype(np.uint8).reshape(h, w)
 
-        # vectorised index lookup via structured-array searchsorted
-        dt = np.dtype((np.void, flat.shape[1] * flat.dtype.itemsize))
-        flat_s = np.ascontiguousarray(flat).view(dt).ravel()
-        uniq_s = np.ascontiguousarray(uniq).view(dt).ravel()
-        idx = np.searchsorted(uniq_s, flat_s).astype(np.uint8).reshape(h, w)
-
-        # Spec: 1 bit/pixel for 2 colours, 8 bits/pixel otherwise.
-        # (libvncclient / TigerVNC decoders only support 1 or 8.)
         if ncol == 2:
-            packed = bytearray()
-            for row in range(h):
-                byte = 0
-                for col in range(w):
-                    if col % 8 == 0 and col > 0:
-                        packed.append(byte)
-                        byte = 0
-                    byte |= int(idx[row, col] & 1) << (7 - (col % 8))
-                packed.append(byte)
-            packed = bytes(packed)
+            row_bytes = (w + 7) // 8
+            pad_w = row_bytes * 8
+            padded = np.zeros((h, pad_w), dtype=np.uint8)
+            padded[:, :w] = idx & 1
+            packed = np.packbits(padded, axis=1).tobytes()
         else:
             packed = idx.tobytes()
 

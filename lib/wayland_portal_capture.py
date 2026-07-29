@@ -191,7 +191,7 @@ class WaylandPortalCapture():
                 raise self._error
             if self._frame is None:
                 raise RuntimeError('No se pudo obtener un frame de la captura Wayland')
-            return self._frame.copy()
+            return self._frame
 
     def stop(self):
         """Detiene la captura y libera recursos."""
@@ -390,13 +390,12 @@ class WaylandPortalCapture():
         try:
             stride = (width * 3 + 3) & ~3
             data = np.frombuffer(mapinfo.data, dtype=np.uint8)
-            data = data[:stride * height].reshape(height, stride)[:, :width * 3].reshape(height, width, 3)
-            image = Image.fromarray(data, 'RGB')
+            frame = data[:stride * height].reshape(height, stride)[:, :width * 3].reshape(height, width, 3).copy()
         finally:
             buf.unmap(mapinfo)
 
         with self._lock:
-            self._frame = image
+            self._frame = frame
             self._error = None
         self._first_frame_event.set()
         return Gst.FlowReturn.OK

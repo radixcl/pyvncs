@@ -3,6 +3,11 @@ import sys
 from PIL import Image
 from lib import log
 
+_x11_display = None
+_x11_root = None
+_x11_geom = None
+
+
 class ImageGrab():
     @staticmethod
     def _detect_wlroots_compositor():
@@ -47,21 +52,30 @@ class ImageGrab():
         return False
 
     @staticmethod
+    def _get_x11_root():
+        global _x11_display, _x11_root, _x11_geom
+        if _x11_root is None:
+            from Xlib import display
+            _x11_display = display.Display()
+            _x11_root = _x11_display.screen().root
+            _x11_geom = _x11_root.get_geometry()
+        return _x11_root, _x11_geom
+
+    @staticmethod
     def grab():
         if sys.platform == "linux" or sys.platform == "linux2":
             is_wl = ImageGrab._is_wayland_session()
 
             if not is_wl:
                 try:
-                    from Xlib import display, X
-                    dsp = display.Display()
-                    root = dsp.screen().root
-                    geom = root.get_geometry()
+                    from Xlib import X
+                    root, geom = ImageGrab._get_x11_root()
                     w = geom.width
                     h = geom.height
                     raw = root.get_image(0, 0, w, h, X.ZPixmap, 0xffffffff)
-                    image = Image.frombytes("RGB", (w, h), raw.data, "raw", "BGRX")
-                    return image
+                    import numpy as np
+                    arr = np.frombuffer(raw.data, dtype=np.uint8).reshape(h, w, 4)[:, :, :3]
+                    return arr[:, :, ::-1].copy()
                 except Exception as e:
                     log.debug(f"ImageGrab: X11 capture failed: {e}")
 
@@ -96,22 +110,25 @@ class ImageGrab():
 
         elif sys.platform == "darwin":
             import Quartz.CoreGraphics as CG
+            import numpy as np
             screenshot = CG.CGWindowListCreateImage(CG.CGRectInfinite, CG.kCGWindowListOptionOnScreenOnly, CG.kCGNullWindowID, CG.kCGWindowImageDefault)
             width = CG.CGImageGetWidth(screenshot)
             height = CG.CGImageGetHeight(screenshot)
             bytesperrow = CG.CGImageGetBytesPerRow(screenshot)
 
             pixeldata = CG.CGDataProviderCopyData(CG.CGImageGetDataProvider(screenshot))
-
-            i = Image.frombytes("RGBA", (width, height), pixeldata)
-            (b, g, r, x) = i.split()
-            i = Image.merge("RGBX", (r, g, b, x))
-
-            return i
+            arr = np.frombuffer(pixeldata, dtype=np.uint8).reshape(height, bytesperrow)
+            arr = arr[:, :width * 4].reshape(height, width, 4)
+            return arr[:, :, [2, 1, 0]].copy()
 
         elif sys.platform == "win32":
+            import numpy as np
             from PIL import ImageGrab as WinImageGrab
-            return WinImageGrab.grab()
+            img = WinImageGrab.grab()
+            arr = np.asarray(img)
+            if arr.shape[2] == 4:
+                arr = arr[:, :, :3]
+            return arr.copy()
 
         else:
             log.debug("ImageGrab: running on an unknown platform!")
