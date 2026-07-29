@@ -1351,7 +1351,8 @@ class TestTightEncoding(unittest.TestCase):
         d.rectangle([32, 0, 63, 31], fill=(0, 255, 0))
         result = enc.send_image(0, 0, 64, 64, img, bpp=32, depth=24)
         ctrl = result[16]
-        self.assertEqual(ctrl >> 4, 0x4, "expected explicit filter")
+        # 0x50 = BasicCompression + read-filter-id + stream 1
+        self.assertEqual(ctrl, 0x50, "expected palette on stream 1")
         self.assertEqual(result[17], 1, "expected palette filter id")
 
     def test_gradient_many_colors(self):
@@ -1367,8 +1368,9 @@ class TestTightEncoding(unittest.TestCase):
         img = Image.fromarray(arr)
         result = enc.send_image(0, 0, 32, 32, img, bpp=32, depth=24)
         ctrl = result[16]
-        self.assertEqual(ctrl >> 4, 0x4, "expected explicit filter")
-        self.assertIn(result[17], (0, 2), "expected copy(0) or gradient(2) filter")
+        # 0x60 = BasicCompression + read-filter-id + stream 2 (gradient)
+        self.assertEqual(ctrl, 0x60, "expected gradient on stream 2")
+        self.assertEqual(result[17], 2, "expected gradient filter id")
 
     def test_jpeg_large_colorful(self):
         """Large colourful image → JPEG compression."""
@@ -1416,6 +1418,48 @@ class TestTightEncoding(unittest.TestCase):
         # Streams are distinct objects
         self.assertIsNot(enc._streams[0], enc._streams[1])
         self.assertIsNot(enc._streams[1], enc._streams[2])
+
+    def test_large_rect_tiled(self):
+        """Rects wider than 2048 are split into multiple tiles."""
+        from PIL import Image
+        from struct import unpack
+        enc = self._enc()
+        img = Image.new('RGB', (2560, 1080), (10, 20, 30))
+        result = enc.send_image(0, 0, 2560, 1080, img, bpp=32, depth=24)
+        num_rects = unpack('!H', result[2:4])[0]
+        # 2560/2048 → 2 cols, 1080/2048 → 1 row → 2 tiles
+        self.assertEqual(num_rects, 2)
+        # First tile: x=0 w=2048
+        r1_x, r1_y, r1_w, r1_h = unpack('!HHHH', result[4:12])
+        self.assertEqual((r1_x, r1_y, r1_w, r1_h), (0, 0, 2048, 1080))
+        # Parse all rect headers by walking the buffer
+        rects = []
+        off = 4  # skip msg header
+        for _ in range(num_rects):
+            rx, ry, rw, rh = unpack('!HHHH', result[off:off+8])
+            enc_id = unpack('>i', result[off+8:off+12])[0]
+            rects.append((rx, ry, rw, rh, enc_id))
+            # skip tight data: for solid fill = 1 ctrl + 3 tpixel = 4 bytes
+            off += 12 + 4
+        self.assertEqual(rects[0][:4], (0, 0, 2048, 1080))
+        self.assertEqual(rects[1][:4], (2048, 0, 512, 1080))
+        self.assertTrue(all(r[4] == 7 for r in rects))
+
+    def test_palette_size_is_ncol_minus_one(self):
+        """Palette filter writes (ncol-1) per Tight spec."""
+        from PIL import Image, ImageDraw
+        enc = self._enc()
+        img = Image.new('RGB', (32, 32), (0, 0, 0))
+        d = ImageDraw.Draw(img)
+        d.rectangle([0, 0, 15, 31], fill=(255, 0, 0))
+        result = enc.send_image(0, 0, 32, 32, img, bpp=32, depth=24)
+        # Find the palette filter: ctrl(0x50) + filter_id(1) + palette_size
+        ctrl = result[16]
+        self.assertEqual(ctrl, 0x50)  # BasicCompression + read-filter-id + stream 1
+        self.assertEqual(result[17], 1)  # palette filter id
+        palette_size_byte = result[18]
+        # 2 colours → byte should be 1 (ncol - 1)
+        self.assertEqual(palette_size_byte, 1)
 
 
 if __name__ == '__main__':

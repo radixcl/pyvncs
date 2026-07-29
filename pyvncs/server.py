@@ -477,12 +477,18 @@ class VNCServer():
                     self._fb_event.set()
 
                 elif b == 4:  # keyboard event — process immediately
-                    self._kbd_controller.process_event(
-                        sock.recv(7, socket.MSG_WAITALL))
+                    kbd_data = sock.recv(7, socket.MSG_WAITALL)
+                    if len(kbd_data) < 7:
+                        log.debug("Short keyboard read (%d bytes), closing" % len(kbd_data))
+                        break
+                    self._kbd_controller.process_event(kbd_data)
 
                 elif b == 5:  # PointerEvent — process immediately
-                    self._mouse_controller.process_event(
-                        sock.recv(5, socket.MSG_WAITALL))
+                    ptr_data = sock.recv(5, socket.MSG_WAITALL)
+                    if len(ptr_data) < 5:
+                        log.debug("Short pointer read (%d bytes), closing" % len(ptr_data))
+                        break
+                    self._mouse_controller.process_event(ptr_data)
 
                 elif b == 6:  # ClientCutText
                     text = self._clipboard_controller.client_cut_text(sock)
@@ -727,6 +733,7 @@ class VNCServer():
 
             # send image with client defined encoding
             self.encoding_object.framebuffer = self.framebuffer
+            self.encoding_object.primaryOrder = self.primaryOrder
             sendbuff.extend(self.encoding_object.send_image(x, y, w, h, image, self.bpp, self.depth))
         else:
             log.debug("[!] Unsupported BPP: %s" % self.bpp)

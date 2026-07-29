@@ -4,6 +4,7 @@ import zlib
 import numpy as np
 from struct import pack
 from io import BytesIO
+from PIL import Image
 
 
 class Encoding:
@@ -59,35 +60,57 @@ class Encoding:
             zlib.Z_DEFAULT_COMPRESSION, zlib.DEFLATED,
             zlib.MAX_WBITS, zlib.DEF_MEM_LEVEL, zlib.Z_DEFAULT_STRATEGY)
 
+    # Tight decoders (libvncclient, TigerVNC) reject rects wider/taller
+    # than this.  We tile large updates into a grid of strips.
+    MAX_RECT = 2048
+
     # ------------------------------------------------------------------
     # public API
     # ------------------------------------------------------------------
 
     def send_image(self, x, y, w, h, image, bpp=32, depth=24):
-        sendbuff = bytearray()
-        sendbuff.extend(pack("!BxH", 0, 1))
-        sendbuff.extend(pack("!HHHH", x, y, w, h))
-        sendbuff.extend(pack(">i", self.id))
+        # Split into tiles that fit within MAX_RECT
+        tiles = []
+        for ty in range(0, h, self.MAX_RECT):
+            th = min(self.MAX_RECT, h - ty)
+            for tx in range(0, w, self.MAX_RECT):
+                tw = min(self.MAX_RECT, w - tx)
+                tiles.append((x + tx, y + ty, tw, th,
+                              image.crop((tx, ty, tx + tw, ty + th))))
 
+        sendbuff = bytearray()
+        sendbuff.extend(pack("!BxH", 0, len(tiles)))
+
+        for rx, ry, rw, rh, tile in tiles:
+            sendbuff.extend(pack("!HHHH", rx, ry, rw, rh))
+            sendbuff.extend(pack(">i", self.id))
+            sendbuff.extend(self._encode_tile(tile, rw, rh, bpp, depth))
+
+        return sendbuff
+
+    def _encode_tile(self, image, w, h, bpp, depth):
+        """Encode a single tile (already ≤ MAX_RECT in each dimension)."""
         tps = self._tpixel_size(bpp, depth)
         arr = np.asarray(image)
         if arr.ndim == 2:
             arr = arr.reshape(arr.shape[0], arr.shape[1], 1)
 
-        # unique-colour count drives the filter choice
+        # rfb_bitmap swaps R↔B for "bgr" primaryOrder (needed by raw/zlib
+        # which pack pixels with the client's shift values).  TPIXEL is
+        # always plain RGB per the Tight spec, so undo the swap here.
+        if getattr(self, 'primaryOrder', 'rgb') == 'bgr' and arr.shape[2] >= 3:
+            arr = arr[:, :, [2, 1, 0]]
+
         flat = arr.reshape(-1, arr.shape[2])
         ncol = len(np.unique(flat, axis=0))
 
         if ncol == 1:
-            sendbuff.extend(self._fill(arr, tps))
-        elif bpp >= 24 and self._want_jpeg(arr, w, h):
-            sendbuff.extend(self._jpeg(image))
-        elif ncol <= 256:
-            sendbuff.extend(self._palette(arr, tps, bpp, depth))
-        else:
-            sendbuff.extend(self._best_of_gradient_copy(arr, tps, bpp, depth))
-
-        return sendbuff
+            return self._fill(arr, tps)
+        if bpp >= 24 and self._want_jpeg(arr, w, h):
+            return self._jpeg_from_arr(arr)
+        if ncol <= 256:
+            return self._palette(arr, tps, bpp, depth)
+        return self._many_colours(arr, tps, bpp, depth)
 
     # ------------------------------------------------------------------
     # TPIXEL helpers
@@ -156,9 +179,9 @@ class Encoding:
     # filter: JPEG  (control 0x9_)
     # ------------------------------------------------------------------
 
-    def _jpeg(self, image):
-        if image.mode != 'RGB':
-            image = image.convert('RGB')
+    def _jpeg_from_arr(self, arr):
+        # arr is already RGB (swap undone in _encode_tile)
+        image = Image.fromarray(arr[:, :, :3].astype(np.uint8))
         buf = BytesIO()
         image.save(buf, format='JPEG', quality=self._jpeg_quality)
         jpg = buf.getvalue()
@@ -177,7 +200,7 @@ class Encoding:
         return len(np.unique(sample, axis=0)) > 96
 
     # ------------------------------------------------------------------
-    # filter: palette  (explicit 0x4_, filter-id 1)
+    # filter: palette  (explicit, filter-id 1, stream 1)
     # ------------------------------------------------------------------
 
     def _palette(self, arr, tps, bpp, depth):
@@ -194,46 +217,44 @@ class Encoding:
         uniq_s = np.ascontiguousarray(uniq).view(dt).ravel()
         idx = np.searchsorted(uniq_s, flat_s).astype(np.uint8).reshape(h, w)
 
-        # pack indices
-        if ncol <= 2:
-            bpi = 1
-        elif ncol <= 4:
-            bpi = 2
-        elif ncol <= 16:
-            bpi = 4
-        else:
-            bpi = 8
-
-        if bpi == 8:
-            packed = idx.tobytes()
-        else:
-            ppb = 8 // bpi
-            mask = (1 << bpi) - 1
+        # Spec: 1 bit/pixel for 2 colours, 8 bits/pixel otherwise.
+        # (libvncclient / TigerVNC decoders only support 1 or 8.)
+        if ncol == 2:
             packed = bytearray()
             for row in range(h):
-                for c0 in range(0, w, ppb):
-                    byte = 0
-                    for k in range(ppb):
-                        c = c0 + k
-                        if c < w:
-                            byte |= int(idx[row, c] & mask) << (8 - bpi * (k + 1))
-                    packed.append(byte)
+                byte = 0
+                for col in range(w):
+                    if col % 8 == 0 and col > 0:
+                        packed.append(byte)
+                        byte = 0
+                    byte |= int(idx[row, col] & 1) << (7 - (col % 8))
+                packed.append(byte)
             packed = bytes(packed)
+        else:
+            packed = idx.tobytes()
 
-        comp = self._compress(packed, self._S_PALETTE)
+        # Spec: if uncompressed size < 12, send raw (no zlib)
+        if len(packed) < 12:
+            comp = None
+        else:
+            comp = self._compress(packed, self._S_PALETTE)
 
         out = bytearray()
-        out.append((self._EXPLICIT << 4) | (1 << self._S_PALETTE))
+        # control byte: BasicCompression, read-filter-id, stream 1
+        out.append((self._EXPLICIT << 4) | (self._S_PALETTE << 4))
         out.append(self._PALETTE)
-        out.append(ncol)
+        out.append(ncol - 1)  # spec: "number of colours minus one"
         for c in uniq:
             out.extend(bytes(c[:tps]))
-        out.extend(self._compact_len(len(comp)))
-        out.extend(comp)
+        if comp is not None:
+            out.extend(self._compact_len(len(comp)))
+            out.extend(comp)
+        else:
+            out.extend(packed)
         return bytes(out)
 
     # ------------------------------------------------------------------
-    # filter: gradient  (explicit 0x4_, filter-id 2)
+    # filter: gradient  (explicit, filter-id 2, stream 2)
     # ------------------------------------------------------------------
 
     def _gradient(self, arr, tps, bpp, depth):
@@ -247,39 +268,50 @@ class Encoding:
 
         pred = np.clip(left + above - ul, 0, 255).astype(np.uint8)
         diff = ((src.astype(np.int16) - pred.astype(np.int16)) & 0xFF).astype(np.uint8)
-
-        comp = self._compress(diff.tobytes(), self._S_GRADIENT)
+        raw = diff.tobytes()
 
         out = bytearray()
-        out.append((self._EXPLICIT << 4) | (1 << self._S_GRADIENT))
+        # control byte: BasicCompression, read-filter-id, stream 2
+        out.append((self._EXPLICIT << 4) | (self._S_GRADIENT << 4))
         out.append(self._GRADIENT)
-        out.extend(self._compact_len(len(comp)))
-        out.extend(comp)
+        if len(raw) < 12:
+            out.extend(raw)
+        else:
+            comp = self._compress(raw, self._S_GRADIENT)
+            out.extend(self._compact_len(len(comp)))
+            out.extend(comp)
         return bytes(out)
 
     # ------------------------------------------------------------------
-    # filter: copy  (explicit 0x4_, filter-id 0)
+    # filter: copy  (explicit, filter-id 0, stream 0)
     # ------------------------------------------------------------------
 
     def _copy(self, arr, tps, bpp, depth):
         raw = self._to_tpixels(arr, bpp, depth)
-        comp = self._compress(raw, self._S_COPY)
 
         out = bytearray()
-        out.append((self._EXPLICIT << 4) | (1 << self._S_COPY))
+        # control byte: BasicCompression, read-filter-id, stream 0
+        out.append((self._EXPLICIT << 4) | (self._S_COPY << 4))
         out.append(self._COPY)
-        out.extend(self._compact_len(len(comp)))
-        out.extend(comp)
+        if len(raw) < 12:
+            out.extend(raw)
+        else:
+            comp = self._compress(raw, self._S_COPY)
+            out.extend(self._compact_len(len(comp)))
+            out.extend(comp)
         return bytes(out)
 
     # ------------------------------------------------------------------
-    # pick best of gradient / copy
+    # >256 colours: gradient filter (stream 2)
     # ------------------------------------------------------------------
+    # NOTE: we must NOT compress into both stream 0 and stream 2 to
+    # "pick the smallest" — the unused stream would accumulate state
+    # the client never sees, desyncing zlib and causing inflate errors
+    # on the next update.  Gradient is almost always smaller than raw
+    # copy for complex images, so we use it unconditionally.
 
-    def _best_of_gradient_copy(self, arr, tps, bpp, depth):
-        g = self._gradient(arr, tps, bpp, depth)
-        c = self._copy(arr, tps, bpp, depth)
-        return g if len(g) <= len(c) else c
+    def _many_colours(self, arr, tps, bpp, depth):
+        return self._gradient(arr, tps, bpp, depth)
 
 
 common.encodings[common.ENCODINGS.tight] = Encoding

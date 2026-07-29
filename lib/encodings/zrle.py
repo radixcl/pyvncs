@@ -70,16 +70,19 @@ class Encoding:
             return 3
         return max(bpp // 8, 1)
 
-    @staticmethod
-    def _pixels_as_bytes(image, bpp, depth):
+    def _pixels_as_bytes(self, image, bpp, depth):
         """Return (flat_bytes, cpixel_size, width, height).
 
-        The byte order matches what the raw encoder produces so the
-        client interprets colours identically.
+        CPIXEL is always plain RGB per the ZRLE spec (first byte = red,
+        second = green, third = blue), regardless of the pixel format's
+        shift values.  rfb_bitmap swaps R↔B for "bgr" primaryOrder (needed
+        by raw/zlib), so we undo that swap here.
         """
         arr = np.asarray(image)
         if arr.ndim == 2:
             arr = arr.reshape(arr.shape[0], arr.shape[1], 1)
+        if getattr(self, 'primaryOrder', 'rgb') == 'bgr' and arr.shape[2] >= 3:
+            arr = arr[:, :, [2, 1, 0]]
         h, w = arr.shape[:2]
         cps = Encoding._cpixel_size(bpp, depth)
 

@@ -30,16 +30,23 @@ class ClipboardController():
         4            U32	 	        length
         length	        U8 array	 	text
         """
+        import socket as _socket
 
         # read padding
-        _ = sock.recv(3)
+        _ = sock.recv(3, _socket.MSG_WAITALL)
 
         # read length
-        length = sock.recv(4)
+        length = sock.recv(4, _socket.MSG_WAITALL)
+        if len(length) < 4:
+            log.debug("ClientCutText: short length read (%d bytes)" % len(length))
+            return None
         (length, ) = unpack('!I', length)
 
         # read text
-        text = sock.recv(length)
+        text = sock.recv(length, _socket.MSG_WAITALL)
+        if len(text) < length:
+            log.debug("ClientCutText: short text read (%d/%d bytes)" % (len(text), length))
+            return None
 
         with self._lock:
             self._last_clipboard = text.decode('iso8859-1', errors='replace')
