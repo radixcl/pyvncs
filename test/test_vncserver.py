@@ -866,6 +866,7 @@ class TestThreadedResponsiveness(unittest.TestCase):
 
         def counting_send(self, sock, x, y, w, h, incremental=0):
             send_count[0] += 1
+            time.sleep(0.05)  # simulate slow encoding so requests pile up
             return original_send(self, sock, x, y, w, h, incremental)
 
         with self._ServerRunner(self) as srv:
@@ -1232,6 +1233,189 @@ class TestKeyboardController(unittest.TestCase):
         ctrl.close()
         ctrl.close()
         ctrl.close()
+
+
+class TestZRLEEncoding(unittest.TestCase):
+    """Unit tests for the ZRLE encoding (RFC 6143 §7.6.9)."""
+
+    def _enc(self):
+        from lib.encodings.zrle import Encoding
+        return Encoding()
+
+    def test_solid_tile(self):
+        """A single-colour image produces a solid subencoding (type 1)."""
+        from PIL import Image
+        enc = self._enc()
+        img = Image.new('RGB', (64, 64), (10, 20, 30))
+        result = enc.send_image(0, 0, 64, 64, img, bpp=32, depth=24)
+        # header: 4 (msg) + 8 (rect) + 4 (enc) + 4 (zlib len) = 20
+        self.assertEqual(result[0], 0)  # FramebufferUpdate
+        self.assertGreater(len(result), 20)
+
+    def test_two_color_palette(self):
+        """Two colours → packed palette with 1-bit indices."""
+        from PIL import Image, ImageDraw
+        enc = self._enc()
+        img = Image.new('RGB', (64, 64), (0, 0, 0))
+        d = ImageDraw.Draw(img)
+        d.rectangle([0, 0, 31, 63], fill=(255, 255, 255))
+        result = enc.send_image(0, 0, 64, 64, img, bpp=32, depth=24)
+        self.assertGreater(len(result), 20)
+
+    def test_many_colors_uses_rle_or_raw(self):
+        """A gradient image (many colours) should still encode correctly."""
+        from PIL import Image
+        import numpy as np
+        enc = self._enc()
+        arr = np.zeros((64, 64, 3), dtype=np.uint8)
+        for y in range(64):
+            arr[y, :, 0] = y * 4 % 256
+            arr[y, :, 1] = (y * 7) % 256
+            arr[y, :, 2] = (y * 13) % 256
+        img = Image.fromarray(arr)
+        result = enc.send_image(0, 0, 64, 64, img, bpp=32, depth=24)
+        self.assertGreater(len(result), 20)
+
+    def test_non_aligned_size(self):
+        """Tiles at edges smaller than 64×64 are handled."""
+        from PIL import Image
+        enc = self._enc()
+        img = Image.new('RGB', (100, 70), (50, 100, 150))
+        result = enc.send_image(0, 0, 100, 70, img, bpp=32, depth=24)
+        from struct import unpack
+        rw, rh = unpack('!HH', result[8:12])
+        self.assertEqual((rw, rh), (100, 70))
+
+    def test_16bpp(self):
+        """ZRLE works at 16 bpp (2-byte TPIXEL)."""
+        from PIL import Image
+        enc = self._enc()
+        img = Image.new('RGB', (32, 32), (200, 100, 50))
+        result = enc.send_image(0, 0, 32, 32, img, bpp=16, depth=16)
+        self.assertGreater(len(result), 20)
+
+    def test_persistent_zlib_stream(self):
+        """Successive calls reuse the same zlib stream (compressor state)."""
+        from PIL import Image
+        enc = self._enc()
+        img1 = Image.new('RGB', (32, 32), (10, 20, 30))
+        img2 = Image.new('RGB', (32, 32), (10, 20, 30))
+        r1 = enc.send_image(0, 0, 32, 32, img1, bpp=32, depth=24)
+        r2 = enc.send_image(0, 0, 32, 32, img2, bpp=32, depth=24)
+        # Second identical frame should compress better (shared dictionary)
+        zlib_len_1 = int.from_bytes(r1[16:20], 'big')
+        zlib_len_2 = int.from_bytes(r2[16:20], 'big')
+        self.assertLessEqual(zlib_len_2, zlib_len_1)
+
+    def test_run_length_encoding(self):
+        """_run_len produces correct 7-bit chunk encoding."""
+        from lib.encodings.zrle import Encoding
+        # run of 1 → value 0 → single byte 0x00
+        self.assertEqual(Encoding._run_len(1), b'\x00')
+        # run of 2 → value 1 → 0x01
+        self.assertEqual(Encoding._run_len(2), b'\x01')
+        # run of 128 → value 127 → 0x7f
+        self.assertEqual(Encoding._run_len(128), b'\x7f')
+        # run of 129 → value 128 → 0x80 0x01
+        self.assertEqual(Encoding._run_len(129), b'\x80\x01')
+        # run of 256 → value 255 → 0xff 0x01
+        self.assertEqual(Encoding._run_len(256), b'\xff\x01')
+
+
+class TestTightEncoding(unittest.TestCase):
+    """Unit tests for the Tight encoding (RFC 6143 §7.6.7)."""
+
+    def _enc(self):
+        from lib.encodings.tight import Encoding
+        return Encoding()
+
+    def test_fill_single_color(self):
+        """Single-colour image → fill compression (control 0x8_)."""
+        from PIL import Image
+        enc = self._enc()
+        img = Image.new('RGB', (32, 32), (100, 150, 200))
+        result = enc.send_image(0, 0, 32, 32, img, bpp=32, depth=24)
+        # header: 4 (msg) + 8 (rect) + 4 (enc id) = 16 bytes
+        ctrl = result[16]
+        self.assertEqual(ctrl >> 4, 0x8, "expected fill compression")
+        # fill = 1 control byte + 3 TPIXEL bytes = 4 bytes payload
+        self.assertEqual(len(result), 16 + 4)
+
+    def test_palette_few_colors(self):
+        """Image with ≤256 colours → palette filter."""
+        from PIL import Image, ImageDraw
+        enc = self._enc()
+        img = Image.new('RGB', (64, 64), (0, 0, 0))
+        d = ImageDraw.Draw(img)
+        d.rectangle([0, 0, 31, 63], fill=(255, 0, 0))
+        d.rectangle([32, 0, 63, 31], fill=(0, 255, 0))
+        result = enc.send_image(0, 0, 64, 64, img, bpp=32, depth=24)
+        ctrl = result[16]
+        self.assertEqual(ctrl >> 4, 0x4, "expected explicit filter")
+        self.assertEqual(result[17], 1, "expected palette filter id")
+
+    def test_gradient_many_colors(self):
+        """Image with >256 colours but small → gradient or copy filter (not JPEG)."""
+        from PIL import Image
+        import numpy as np
+        enc = self._enc()
+        # 32×32 = 1024 px < 4096 threshold → JPEG is skipped
+        arr = np.zeros((32, 32, 3), dtype=np.uint8)
+        for y in range(32):
+            for x in range(32):
+                arr[y, x] = [(x * 8) % 256, (y * 8) % 256, ((x + y) * 4) % 256]
+        img = Image.fromarray(arr)
+        result = enc.send_image(0, 0, 32, 32, img, bpp=32, depth=24)
+        ctrl = result[16]
+        self.assertEqual(ctrl >> 4, 0x4, "expected explicit filter")
+        self.assertIn(result[17], (0, 2), "expected copy(0) or gradient(2) filter")
+
+    def test_jpeg_large_colorful(self):
+        """Large colourful image → JPEG compression."""
+        from PIL import Image
+        import numpy as np
+        enc = self._enc()
+        rng = np.random.default_rng(42)
+        arr = rng.integers(0, 256, (128, 128, 3), dtype=np.uint8)
+        img = Image.fromarray(arr)
+        result = enc.send_image(0, 0, 128, 128, img, bpp=32, depth=24)
+        ctrl = result[16]
+        self.assertEqual(ctrl >> 4, 0x9, "expected JPEG compression")
+
+    def test_compact_length(self):
+        """Compact length encoding produces correct bytes."""
+        from lib.encodings.tight import Encoding
+        self.assertEqual(Encoding._compact_len(0), b'\x00')
+        self.assertEqual(Encoding._compact_len(127), b'\x7f')
+        self.assertEqual(Encoding._compact_len(128), b'\x80\x01')
+        self.assertEqual(Encoding._compact_len(16383), b'\xff\x7f')
+        self.assertEqual(Encoding._compact_len(16384), b'\x80\x80\x01')
+
+    def test_non_aligned_size(self):
+        """Non-power-of-two dimensions are handled."""
+        from PIL import Image
+        enc = self._enc()
+        img = Image.new('RGB', (33, 17), (50, 100, 150))
+        result = enc.send_image(0, 0, 33, 17, img, bpp=32, depth=24)
+        from struct import unpack
+        rw, rh = unpack('!HH', result[8:12])
+        self.assertEqual((rw, rh), (33, 17))
+
+    def test_16bpp(self):
+        """Tight works at 16 bpp."""
+        from PIL import Image
+        enc = self._enc()
+        img = Image.new('RGB', (32, 32), (200, 100, 50))
+        result = enc.send_image(0, 0, 32, 32, img, bpp=16, depth=16)
+        self.assertGreater(len(result), 16)
+
+    def test_four_zlib_streams_independent(self):
+        """Each filter uses its own zlib stream."""
+        enc = self._enc()
+        self.assertEqual(len(enc._streams), 4)
+        # Streams are distinct objects
+        self.assertIsNot(enc._streams[0], enc._streams[1])
+        self.assertIsNot(enc._streams[1], enc._streams[2])
 
 
 if __name__ == '__main__':

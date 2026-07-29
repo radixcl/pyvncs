@@ -22,14 +22,14 @@ class ENCODINGS:
     zlib = 6
     tight = 7
     hextile = 5
-    #zrle = 16
+    zrle = 16
     # supported pseudo-encodings
     cursor = -239
 
 encodings_priority = [
-    #ENCODINGS.zrle,
-    ENCODINGS.hextile,
     ENCODINGS.tight,
+    ENCODINGS.zrle,
+    ENCODINGS.hextile,
     ENCODINGS.zlib,
     ENCODINGS.raw
 ]

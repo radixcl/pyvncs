@@ -21,8 +21,8 @@ class ImageGrab():
         session_type = os.environ.get('XDG_SESSION_TYPE', '')
         display = os.environ.get('DISPLAY', '')
 
-        log.debug(f"ImageGrab: WAYLAND_DISPLAY={repr(wayland_display)} "
-                  f"XDG_SESSION_TYPE={repr(session_type)} DISPLAY={repr(display)}")
+        #log.debug(f"ImageGrab: WAYLAND_DISPLAY={repr(wayland_display)} "
+        #          f"XDG_SESSION_TYPE={repr(session_type)} DISPLAY={repr(display)}")
 
         # Wayland takes priority if WAYLAND_DISPLAY is set
         if wayland_display:

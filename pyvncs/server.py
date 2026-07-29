@@ -678,7 +678,7 @@ class VNCServer():
 
         rectangle = self.get_rectangle(x, y, w, h)
         if not rectangle:
-            log.debug("send_rectangles: get_rectangle returned falsy for (%d,%d,%d,%d)" % (x, y, w, h))
+            #log.debug("send_rectangles: get_rectangle returned falsy for (%d,%d,%d,%d)" % (x, y, w, h))
             rectangle = Image.new("RGB", [w, h], (0,0,0))
 
         lastshot = rectangle
@@ -738,7 +738,7 @@ class VNCServer():
         # has accepted all bytes — which is exactly what we want here.
         try:
             sock.sendall(sendbuff)
-            log.debug("send_rectangles: sent %d bytes for (%d,%d,%d,%d)" % (len(sendbuff), x, y, w, h))
+            #log.debug("send_rectangles: sent %d bytes for (%d,%d,%d,%d)" % (len(sendbuff), x, y, w, h))
         except Exception as e:
             log.debug("Error sending changes: %s" % e)
             return False

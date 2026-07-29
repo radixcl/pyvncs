@@ -27,7 +27,8 @@ if 'raw' not in _DISABLED_ENCODINGS:
     from . import raw
 if 'zlib' not in _DISABLED_ENCODINGS:
     from . import zlib
-#from . import zrle
+if 'zrle' not in _DISABLED_ENCODINGS:
+    from . import zrle
 if 'tight' not in _DISABLED_ENCODINGS:
     from . import tight
 if 'hextile' not in _DISABLED_ENCODINGS:
