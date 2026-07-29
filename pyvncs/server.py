@@ -84,9 +84,12 @@ from lib.auth.vencrypt import VeNCrypt
 class VNCServer():
 
     class RFB_SECTYPES:
-        vncauth = 2     # plain VNC auth
-        vencrypt = 19   # VeNCrypt
-        unix = 129      # Unix Login Authentication
+        none = 1         # no authentication
+        vncauth = 2      # plain VNC auth (DES challenge)
+        tls = 18         # anonymous TLS + VNC auth (TigerVNC)
+        apple_ard = 30   # Apple Remote Desktop (DH + AES)
+        vencrypt = 19    # VeNCrypt
+        unix = 129       # Unix Login Authentication
 
     encoding_object = None
     last_cursor = None
@@ -104,13 +107,34 @@ class VNCServer():
         self.cursor_encoding = CursorEncoding()
 
         # Adaptive rate limiting: start conservative, adjust based on throughput
+        try:
+            fps = int(vnc_config.fps) if vnc_config else 20
+        except (TypeError, ValueError, AttributeError):
+            fps = 20
         self.fbupdate_min_interval = 0.02    # hard floor (50 fps max)
         self.fbupdate_max_interval = 0.20   # ceiling for slow links
-        self.fbupdate_rate_limit = 0.05     # initial interval (20 fps)
+        self.fbupdate_rate_limit = 1.0 / max(1, fps)
         self._bw_estimator = _BandwidthEstimator()
+        self._no_cursor = bool(getattr(vnc_config, 'no_cursor', False)) if vnc_config else False
 
         log.debug("Configured auth type:", self.auth_type)
 
+    def _parse_userlist(self):
+        if ':' in self.password:
+            default_user, default_pass = self.password.split(':', 1)
+        else:
+            default_user = 'user'
+            default_pass = self.password
+
+        userlist = {default_user: default_pass}
+
+        if ';' in self.password:
+            userlist = {}
+            for entry in self.password.split(';'):
+                if ':' in entry:
+                    u, p = entry.split(':', 1)
+                    userlist[u] = p
+        return userlist
 
     def __del__(self):
         log.debug("VncServer died")
@@ -182,11 +206,21 @@ class VNCServer():
 
         log.debug("sec type data: %s" % data)
 
-        # Working socket - may be replaced by SSL socket after VeNCrypt TLS
+        # Working socket - may be replaced by SSL socket after TLS
         working_sock = sock
 
-        # VNC Auth
-        if sectype == self.RFB_SECTYPES.vncauth:
+        # Parse userlist from password string
+        userlist = self._parse_userlist()
+
+        # None (type 1)
+        if sectype == self.RFB_SECTYPES.none:
+            from lib.auth.none_auth import NoneAuth
+            if not NoneAuth().auth(sock):
+                sock.close()
+                return False
+
+        # VNC Auth (type 2)
+        elif sectype == self.RFB_SECTYPES.vncauth:
             auth = VNCAuth()
             auth.getbuff = self.get_buffer
             if not auth.auth(sock, self.password):
@@ -197,67 +231,102 @@ class VNCServer():
                 sock.close()
                 return False
 
-        # VeNCrypt
+        # TLS (type 18) - anonymous TLS + VNC DES auth
+        elif sectype == self.RFB_SECTYPES.tls:
+            from lib.auth.tls_auth import TLSAuth
+            auth = TLSAuth()
+            auth.pem_file = self.pem_file
+            if not auth.auth(sock, self.password):
+                sock.close()
+                return False
+            working_sock = auth.get_socket() or sock
+
+        # Apple ARD (type 30)
+        elif sectype == self.RFB_SECTYPES.apple_ard:
+            from lib.auth.apple_ard import AppleARDAuth
+            auth = AppleARDAuth()
+            if not auth.auth(sock, userlist):
+                sock.close()
+                return False
+
+        # VeNCrypt (type 19)
         elif sectype == self.RFB_SECTYPES.vencrypt:
-            # Parse credentials: "password" for Plain, "user:pass" for TLSPlain
-            if ':' in self.password:
-                default_user, default_pass = self.password.split(':', 1)
-            else:
-                default_user = 'user'
-                default_pass = self.password
-
-            userlist = {
-                default_user: default_pass
-            }
-
-            # Also parse additional users if password has multiple user:pass entries
-            # separated by semicolons: "user1:pass1;user2:pass2"
-            if ';' in self.password:
-                userlist = {}
-                for entry in self.password.split(';'):
-                    if ':' in entry:
-                        u, p = entry.split(':', 1)
-                        userlist[u] = p
-
             auth = VeNCrypt(sock)
             auth.getbuff = self.get_buffer
             auth.pem_file = self.pem_file
             auth.send_subtypes()
-            client_subtype = auth.client_subtype
+            st = auth.client_subtype
 
-            if client_subtype == VeNCrypt.SUBTYPE_PLAIN:
-                # Plain auth without TLS encryption
-                log.debug(__name__, "Using VeNCrypt Plain auth (no TLS)")
+            if st == VeNCrypt.SUBTYPE_TLSNONE:
+                log.debug(__name__, "VeNCrypt TLSNone")
+                if not auth.auth_tls_none():
+                    sock.close()
+                    return False
+                working_sock = auth.get_socket()
+
+            elif st == VeNCrypt.SUBTYPE_TLSVNC:
+                log.debug(__name__, "VeNCrypt TLSVnc")
+                if not auth.auth_tls_vnc(self.password):
+                    sock.close()
+                    return False
+                working_sock = auth.get_socket()
+
+            elif st in (VeNCrypt.SUBTYPE_TLSPLAIN, VeNCrypt.SUBTYPE_TLSPLAIN2):
+                log.debug(__name__, "VeNCrypt TLSPlain")
+                if not auth.auth_tls_plain(userlist):
+                    sock.close()
+                    return False
+                working_sock = auth.get_socket()
+
+            elif st == VeNCrypt.SUBTYPE_X509NONE:
+                log.debug(__name__, "VeNCrypt X509None")
+                if not auth.auth_x509_none():
+                    sock.close()
+                    return False
+                working_sock = auth.get_socket()
+
+            elif st == VeNCrypt.SUBTYPE_X509VNC:
+                log.debug(__name__, "VeNCrypt X509Vnc")
+                if not auth.auth_x509_vnc(self.password):
+                    sock.close()
+                    return False
+                working_sock = auth.get_socket()
+
+            elif st == VeNCrypt.SUBTYPE_X509PLAIN:
+                log.debug(__name__, "VeNCrypt X509Plain")
+                if not auth.auth_x509_plain(userlist):
+                    sock.close()
+                    return False
+                working_sock = auth.get_socket()
+
+            elif st == VeNCrypt.SUBTYPE_PLAIN:
+                log.debug(__name__, "VeNCrypt Plain")
                 if not auth.auth_plain(userlist):
                     sock.close()
                     return False
 
-            elif client_subtype == VeNCrypt.SUBTYPE_TLSPLAIN:
-                # TLS encrypted channel + Plain auth
-                log.debug(__name__, "Using VeNCrypt TLS+Plain auth")
-                if not auth.auth_tls_plain(userlist):
-                    sock.close()
-                    return False
-                # After TLS, all communication goes through the SSL socket
-                working_sock = auth.get_socket()
-
             else:
-                # unsupported subtype
-                log.debug("Unsupported client_subtype:", client_subtype)
-                sendbuff = pack("!I", 1)
-                working_sock.sendall(sendbuff)
-                working_sock.close()
+                log.debug("Unsupported VeNCrypt subtype:", st)
+                sock.sendall(pack("!I", 1))
+                sock.close()
                 return False
 
-            # Store auth object for socket access
             self.vencrypt_auth = auth
+
+        # Unix Login (type 129)
+        elif sectype == self.RFB_SECTYPES.unix:
+            from lib.auth.unix_login import UnixLoginAuth
+            auth = UnixLoginAuth()
+            if not auth.auth(sock, userlist):
+                sock.close()
+                return False
 
         else:
             log.debug("Unsupported auth type")
             sock.close()
             return False
 
-        # Replace working socket if VeNCrypt TLS was used
+        # Replace working socket if TLS was used
         self.socket = working_sock
 
         # Get ClientInit
@@ -435,7 +504,7 @@ class VNCServer():
                     log.debug("client_encodings", repr(self.client_encodings), len(self.client_encodings))
 
                     self.cursor_support = False
-                    if ENCODINGS.cursor in self.client_encodings:
+                    if not self._no_cursor and ENCODINGS.cursor in self.client_encodings:
                         log.debug("client cursor support")
                         self.cursor_encoding = CursorEncoding()
                         self.cursor_support = True
@@ -455,6 +524,11 @@ class VNCServer():
                             self.encoding = e
                             log.debug("Using %s encoding" % encs.common.encodings[self.encoding].name)
                             self.encoding_object = encs.common.encodings[self.encoding]()
+                            if hasattr(self.encoding_object, '_jpeg_quality'):
+                                self.encoding_object._jpeg_quality = self.vnc_config.jpeg_quality
+                            if hasattr(self.encoding_object, '_compression_level'):
+                                self.encoding_object._compression_level = self.vnc_config.compression_level
+                                self.encoding_object._streams = [self.encoding_object._new_stream() for _ in range(4)]
                             selected = True
                             break
 
@@ -631,26 +705,19 @@ class VNCServer():
         w, h = cursor_img.size
         self.last_cursor = cursor_img
 
-        # Ensure RGBA so we can extract the alpha mask
         if cursor_img.mode != "RGBA":
             cursor_img = cursor_img.convert("RGBA")
 
-        # Convert to the framebuffer pixel format (correct bytes-per-pixel)
         bitmap = self.rfb_bitmap
         rgb = bitmap.get_bitmap(cursor_img)
         raw_pixels = self._encode_cursor_pixels(rgb)
 
-        # Build transparency bitmask (1 = opaque, MSB first per row)
-        bitmask = bytearray()
+        alpha = np.asarray(cursor_img)[:, :, 3]
         row_bytes = (w + 7) // 8
-        for j in range(h):
-            row = 0
-            for i in range(w):
-                if cursor_img.getpixel((i, j))[3]:
-                    row |= (128 >> (i % 8))
-                if (i % 8 == 7) or i == w - 1:
-                    bitmask.append(row)
-                    row = 0
+        pad_w = row_bytes * 8
+        padded = np.zeros((h, pad_w), dtype=np.uint8)
+        padded[:, :w] = (alpha > 0).astype(np.uint8)
+        bitmask = np.packbits(padded, axis=1).tobytes()
 
         sendbuff = bytearray()
         sendbuff.extend(pack("!BxH", 0, 1))       # FramebufferUpdate, 1 rect

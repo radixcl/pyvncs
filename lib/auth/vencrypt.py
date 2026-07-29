@@ -25,12 +25,24 @@ from struct import *
 class VeNCrypt():
 
     # VeNCrypt subtypes
-    SUBTYPE_PLAIN = 256      # Plain authentication (no TLS)
-    SUBTYPE_TLSPLAIN = 259   # TLS + Plain authentication
+    SUBTYPE_TLSNONE = 250     # TLS + no auth
+    SUBTYPE_TLSVNC = 251      # TLS + VNC DES challenge
+    SUBTYPE_TLSPLAIN = 252    # TLS + Plain auth
+    SUBTYPE_X509NONE = 253    # X509 client cert + no auth
+    SUBTYPE_X509VNC = 254     # X509 client cert + VNC DES challenge
+    SUBTYPE_X509PLAIN = 255   # X509 client cert + Plain auth
+    SUBTYPE_PLAIN = 256       # Plain authentication (no TLS)
+    SUBTYPE_TLSPLAIN2 = 259   # TLS + Plain (alternate)
 
     subtypes = [
-        SUBTYPE_PLAIN,
+        SUBTYPE_TLSNONE,
+        SUBTYPE_TLSVNC,
         SUBTYPE_TLSPLAIN,
+        SUBTYPE_X509NONE,
+        SUBTYPE_X509VNC,
+        SUBTYPE_X509PLAIN,
+        SUBTYPE_PLAIN,
+        SUBTYPE_TLSPLAIN2,
     ]
 
     def __init__(self, sock):
@@ -307,6 +319,75 @@ class VeNCrypt():
             log.debug(__name__, "TLS auth error:", e)
             self._send_auth_result(False)
             return False
+
+    def _do_tls_handshake(self, require_client_cert=False):
+        sslctx = self._load_ssl_context(self.pem_file)
+        if require_client_cert:
+            sslctx.verify_mode = ssl.CERT_REQUIRED
+            sslctx.load_verify_locations(cafile=self.pem_file)
+        self.sock.settimeout(30)
+        self.ssl_socket = sslctx.wrap_socket(self.sock, server_side=True)
+        self.ssl_socket.settimeout(None)
+        self.sock = self.ssl_socket
+        log.debug(__name__, "TLS handshake completed (client_cert=%s)" % require_client_cert)
+
+    def auth_tls_none(self):
+        try:
+            self._do_tls_handshake(require_client_cert=False)
+            self._send_auth_result(True)
+            return True
+        except Exception as e:
+            log.debug(__name__, "TLSNone error:", e)
+            return False
+
+    def auth_tls_vnc(self, password):
+        try:
+            self._do_tls_handshake(require_client_cert=False)
+            from lib.auth.vnc_auth import VNCAuth
+            vnc = VNCAuth()
+            vnc.getbuff = self._ssl_getbuff
+            return vnc.auth(self.sock, password)
+        except Exception as e:
+            log.debug(__name__, "TLSVnc error:", e)
+            return False
+
+    def auth_x509_none(self):
+        try:
+            self._do_tls_handshake(require_client_cert=True)
+            self._send_auth_result(True)
+            return True
+        except Exception as e:
+            log.debug(__name__, "X509None error:", e)
+            return False
+
+    def auth_x509_vnc(self, password):
+        try:
+            self._do_tls_handshake(require_client_cert=True)
+            from lib.auth.vnc_auth import VNCAuth
+            vnc = VNCAuth()
+            vnc.getbuff = self._ssl_getbuff
+            return vnc.auth(self.sock, password)
+        except Exception as e:
+            log.debug(__name__, "X509Vnc error:", e)
+            return False
+
+    def auth_x509_plain(self, userlist={}):
+        try:
+            self._do_tls_handshake(require_client_cert=True)
+            return self.auth_plain(userlist)
+        except Exception as e:
+            log.debug(__name__, "X509Plain error:", e)
+            self._send_auth_result(False)
+            return False
+
+    def _ssl_getbuff(self, timeout):
+        self.sock.settimeout(timeout)
+        try:
+            data = self.sock.recv(1024)
+        except Exception:
+            data = None
+        self.sock.settimeout(None)
+        return data
 
     def get_socket(self):
         """

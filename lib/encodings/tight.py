@@ -51,13 +51,13 @@ class Encoding:
 
     def __init__(self):
         log.debug("Initialized", __name__)
+        self._compression_level = 1
         self._streams = [self._new_stream() for _ in range(4)]
         self._jpeg_quality = 50
 
-    @staticmethod
-    def _new_stream():
+    def _new_stream(self):
         return zlib.compressobj(
-            1, zlib.DEFLATED,
+            self._compression_level, zlib.DEFLATED,
             zlib.MAX_WBITS, zlib.DEF_MEM_LEVEL, zlib.Z_DEFAULT_STRATEGY)
 
     # Tight decoders (libvncclient, TigerVNC) reject rects wider/taller

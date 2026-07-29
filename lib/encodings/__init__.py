@@ -21,16 +21,25 @@ import os
 _DISABLED_ENCODINGS = os.environ.get('PYVNCS_DISABLED_ENCODINGS', '').lower().split(',')
 _DISABLED_ENCODINGS = [e.strip() for e in _DISABLED_ENCODINGS if e.strip()]
 
+# Whitelist: if set, only these encodings are loaded
+_ONLY_ENCODINGS = os.environ.get('PYVNCS_ONLY_ENCODINGS', '').lower().split(',')
+_ONLY_ENCODINGS = [e.strip() for e in _ONLY_ENCODINGS if e.strip()]
+
+def _enabled(name):
+    if _ONLY_ENCODINGS:
+        return name in _ONLY_ENCODINGS or name == 'raw'
+    return name not in _DISABLED_ENCODINGS
+
 # at least, raw encoding is needed by the rfb protocol    
 from . import common
-if 'raw' not in _DISABLED_ENCODINGS:
+if _enabled('raw'):
     from . import raw
-if 'zlib' not in _DISABLED_ENCODINGS:
+if _enabled('zlib'):
     from . import zlib
-if 'zrle' not in _DISABLED_ENCODINGS:
+if _enabled('zrle'):
     from . import zrle
-if 'tight' not in _DISABLED_ENCODINGS:
+if _enabled('tight'):
     from . import tight
-if 'hextile' not in _DISABLED_ENCODINGS:
+if _enabled('hextile'):
     from . import hextile
 from . import cursor

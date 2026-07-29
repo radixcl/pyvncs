@@ -70,7 +70,8 @@ def main(argv):
     parser.add_argument("-p", "--port", dest="listen_port",
                         help="Listen on this port, default: 5901", required=False, type=int, default=5901)
     parser.add_argument("-A", "--auth-type",
-                        help="Sets VNC authentication type (2=VNC, 19=VeNCrypt). Default: 2",
+                        help="Sets VNC authentication type "
+                             "(1=None, 2=VNC, 18=TLS, 19=VeNCrypt, 30=AppleARD, 129=UnixLogin). Default: 2",
                         required=False,
                         type=int,
                         default=2,
@@ -114,15 +115,49 @@ def main(argv):
                         default="pyvncs")
     parser.add_argument("-E", "--disable-encodings",
                         help="Comma-separated list of encodings to disable "
-                             "(raw, hextile, tight, zlib). Example: -E hextile,zlib",
+                             "(raw, hextile, tight, zlib, zrle). Example: -E hextile,zlib",
                         required=False, dest="disabled_encodings",
                         default='')
+    parser.add_argument("-e", "--only-encodings",
+                        help="Comma-separated whitelist of encodings to allow "
+                             "(raw, hextile, tight, zlib, zrle). Example: -e tight,raw",
+                        required=False, dest="only_encodings",
+                        default='')
+    parser.add_argument("-z", "--compression",
+                        help="Zlib compression level 0-9 (0=fastest, 9=smallest). Default: 1",
+                        required=False, type=int, default=1,
+                        dest="compression_level")
+    parser.add_argument("-q", "--jpeg-quality",
+                        help="JPEG quality 1-100 for tight encoding. Default: 50",
+                        required=False, type=int, default=50,
+                        dest="jpeg_quality")
+    parser.add_argument("-f", "--fps",
+                        help="Maximum frames per second. Default: 20",
+                        required=False, type=int, default=20,
+                        dest="fps")
+    parser.add_argument("-L", "--log-level",
+                        help="Log level (debug, info, warning, error). Default: debug",
+                        required=False, default='debug',
+                        dest="log_level")
+    parser.add_argument("--no-cursor",
+                        help="Disable cursor pseudo-encoding",
+                        required=False, action='store_true',
+                        dest="no_cursor")
+    parser.add_argument("-s", "--scale",
+                        help="Scale factor for framebuffer (e.g. 0.5 for half resolution)",
+                        required=False, type=float, default=1.0,
+                        dest="scale")
 
     args = parser.parse_args()
 
-    # Set env var BEFORE importing pyvncs (which imports lib.encodings)
+    # Set env vars BEFORE importing pyvncs (which imports lib.encodings)
     if args.disabled_encodings:
         os.environ['PYVNCS_DISABLED_ENCODINGS'] = args.disabled_encodings.lower()
+    if args.only_encodings:
+        os.environ['PYVNCS_ONLY_ENCODINGS'] = args.only_encodings.lower()
+
+    # Configure log level before anything else
+    log.set_level(args.log_level)
 
     # Now import pyvncs (encodings will respect the env var)
     import pyvncs
@@ -162,6 +197,11 @@ def main(argv):
     vnc_config.auth_type = args.auth_type
     vnc_config.pem_file = args.pem_file
     vnc_config.win_title = args.win_title
+    vnc_config.compression_level = max(0, min(9, args.compression_level))
+    vnc_config.jpeg_quality = max(1, min(100, args.jpeg_quality))
+    vnc_config.fps = max(1, min(120, args.fps))
+    vnc_config.no_cursor = args.no_cursor
+    vnc_config.scale = args.scale
 
     sockServer = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sockServer.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)

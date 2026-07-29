@@ -22,6 +22,17 @@ import logging
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s: %(message)s')
 logger = logging.getLogger('pyvncs')
 
+_LEVELS = {
+    'debug': logging.DEBUG,
+    'info': logging.INFO,
+    'warning': logging.WARNING,
+    'error': logging.ERROR,
+}
+
+def set_level(level_name):
+    level = _LEVELS.get(level_name.lower(), logging.DEBUG)
+    logger.setLevel(level)
+
 def _log(*args, logtype='debug'):
 
     func = inspect.stack()[2][3]
