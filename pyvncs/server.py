@@ -30,6 +30,7 @@ import threading
 from lib import mousectrl
 from lib import kbdctrl
 from lib import clipboardctrl
+from lib import filetransferctrl
 from lib.imagegrab import ImageGrab
 from lib.rfb_bitmap import RfbBitmap
 from lib import log
@@ -120,6 +121,12 @@ class VNCServer():
             self._scale = float(vnc_config.scale) if vnc_config else 1.0
         except (TypeError, ValueError, AttributeError):
             self._scale = 1.0
+
+        self._file_transfer_enabled = bool(getattr(vnc_config, 'file_transfer', False)) if vnc_config else False
+        ft_root = getattr(vnc_config, 'file_transfer_root', '') if vnc_config else ''
+        if not isinstance(ft_root, str):
+            ft_root = ''
+        self._file_transfer_root = ft_root or None
 
         log.debug("Configured auth type:", self.auth_type)
 
@@ -441,6 +448,8 @@ class VNCServer():
         self._mouse_controller = mousectrl.MouseController()
         self._kbd_controller = kbdctrl.KeyboardController()
         self._clipboard_controller = clipboardctrl.ClipboardController()
+        self._filetransfer_controller = filetransferctrl.FileTransferController(
+            root=self._file_transfer_root, enabled=self._file_transfer_enabled)
 
         self.primaryOrder = "bgr"
         self.encoding = ENCODINGS.raw
@@ -601,6 +610,11 @@ class VNCServer():
                 elif b == 6:  # ClientCutText
                     text = self._clipboard_controller.client_cut_text(sock)
                     log.debug("ClientCutText:", text)
+
+                elif b == 7:  # FileTransfer (UltraVNC/TightVNC extension)
+                    if not self._filetransfer_controller.handle_message(sock, self._sock_write_lock):
+                        log.debug("FileTransfer: handler requested close")
+                        break
 
                 else:
                     fbur_data = sock.recv(4096)

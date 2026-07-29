@@ -180,16 +180,16 @@ class Encoding:
 
     @staticmethod
     def _run_len_bytes(length):
+        # ZRLE run length (RFC 6143 §7.7.6): store (length-1) as a series of
+        # full bytes where a value of 255 means "another byte follows". The
+        # decoder does: len=1; do { len += b; } while (b == 255). This is NOT
+        # a 7-bit varint — using 7-bit groups desyncs TigerVNC on runs >= 129.
         v = length - 1
         out = bytearray()
-        while True:
-            b = v & 0x7F
-            v >>= 7
-            if v:
-                b |= 0x80
-            out.append(b)
-            if not v:
-                break
+        while v >= 255:
+            out.append(255)
+            v -= 255
+        out.append(v)
         return out
 
     @staticmethod

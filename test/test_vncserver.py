@@ -1308,18 +1308,140 @@ class TestZRLEEncoding(unittest.TestCase):
         self.assertLessEqual(zlib_len_2, zlib_len_1)
 
     def test_run_length_encoding(self):
-        """_run_len produces correct 7-bit chunk encoding."""
+        """_run_len uses ZRLE 8-bit runs (255 = continuation), not a 7-bit varint."""
         from lib.encodings.zrle import Encoding
-        # run of 1 → value 0 → single byte 0x00
-        self.assertEqual(Encoding._run_len(1), b'\x00')
-        # run of 2 → value 1 → 0x01
-        self.assertEqual(Encoding._run_len(2), b'\x01')
-        # run of 128 → value 127 → 0x7f
-        self.assertEqual(Encoding._run_len(128), b'\x7f')
-        # run of 129 → value 128 → 0x80 0x01
-        self.assertEqual(Encoding._run_len(129), b'\x80\x01')
-        # run of 256 → value 255 → 0xff 0x01
-        self.assertEqual(Encoding._run_len(256), b'\xff\x01')
+        # stored value is (length-1); a byte of 255 means another byte follows
+        self.assertEqual(Encoding._run_len(1), b'\x00')          # value 0
+        self.assertEqual(Encoding._run_len(2), b'\x01')          # value 1
+        self.assertEqual(Encoding._run_len(128), b'\x7f')        # value 127
+        self.assertEqual(Encoding._run_len(129), b'\x80')        # value 128, one byte
+        self.assertEqual(Encoding._run_len(255), b'\xfe')        # value 254
+        self.assertEqual(Encoding._run_len(256), b'\xff\x00')    # value 255 -> 255,0
+        self.assertEqual(Encoding._run_len(257), b'\xff\x01')    # value 256 -> 255,1
+        self.assertEqual(Encoding._run_len(511), b'\xff\xff\x00')  # value 510 -> 255,255,0
+        self.assertEqual(Encoding._run_len(512), b'\xff\xff\x01')  # value 511 -> 255,255,1
+
+    @staticmethod
+    def _zrle_decode(result, w, h):
+        """Decode a ZRLE FramebufferUpdate using TigerVNC's exact rules
+        (8-bit run lengths where 255 = continuation, 3-byte little-endian
+        CPIXEL). Mirrors common/rfb/ZRLEDecoder.cxx so a round-trip mismatch
+        means the encoder would desync a real TigerVNC client."""
+        import zlib
+        import numpy as np
+        from struct import unpack
+
+        def read_run(buf, pos):
+            length = 1
+            while True:
+                b = buf[pos]; pos += 1
+                length += b
+                if b != 255:
+                    break
+            return length, pos
+
+        def read_cpixel(buf, pos):
+            pixel = buf[pos] | (buf[pos + 1] << 8) | (buf[pos + 2] << 16)
+            return ((pixel >> 16) & 255, (pixel >> 8) & 255, pixel & 255), pos + 3
+
+        def decode_tile(buf, pos, tw, th):
+            sub = buf[pos]; pos += 1
+            n = tw * th
+            pixels = [None] * n
+            if sub == 0:
+                for i in range(n):
+                    pixels[i], pos = read_cpixel(buf, pos)
+            elif sub == 1:
+                col, pos = read_cpixel(buf, pos)
+                pixels = [col] * n
+            elif 2 <= sub <= 127:
+                pal = []
+                for _ in range(sub):
+                    c, pos = read_cpixel(buf, pos)
+                    pal.append(c)
+                bpi = 1 if sub <= 2 else 2 if sub <= 4 else 4 if sub <= 16 else 8
+                for row in range(th):
+                    nbits = 0
+                    byte = 0
+                    for col in range(tw):
+                        if nbits == 0:
+                            byte = buf[pos]; pos += 1; nbits = 8
+                        nbits -= bpi
+                        pixels[row * tw + col] = pal[(byte >> nbits) & ((1 << bpi) - 1)]
+            elif sub == 128:
+                i = 0
+                while i < n:
+                    col, pos = read_cpixel(buf, pos)
+                    run, pos = read_run(buf, pos)
+                    for k in range(run):
+                        pixels[i + k] = col
+                    i += run
+            else:
+                pal = []
+                for _ in range(sub - 128):
+                    c, pos = read_cpixel(buf, pos)
+                    pal.append(c)
+                i = 0
+                while i < n:
+                    idx = buf[pos]; pos += 1
+                    if idx & 128:
+                        run, pos = read_run(buf, pos)
+                    else:
+                        run = 1
+                    idx &= 127
+                    for k in range(run):
+                        pixels[i + k] = pal[idx]
+                    i += run
+            return pixels, pos
+
+        rw, rh = unpack('!HH', result[8:12])
+        zlib_len = unpack('!I', result[16:20])[0]
+        raw = zlib.decompressobj().decompress(result[20:20 + zlib_len])
+        out = np.zeros((rh, rw, 3), dtype=np.uint8)
+        pos = 0
+        for ty in range(0, rh, 64):
+            for tx in range(0, rw, 64):
+                tw = min(64, rw - tx)
+                th = min(64, rh - ty)
+                pixels, pos = decode_tile(raw, pos, tw, th)
+                for i, (r, g, b) in enumerate(pixels):
+                    out[ty + i // tw, tx + i % tw] = (r, g, b)
+        return out
+
+    def _roundtrip(self, img):
+        import numpy as np
+        from PIL import Image
+        enc = self._enc()
+        w, h = img.size
+        orig = np.asarray(img.convert('RGB'))
+        fed = orig[:, :, ::-1].copy()  # mimic rfb_bitmap bgr swap
+        result = enc.send_image(0, 0, w, h, Image.fromarray(fed), bpp=32, depth=24)
+        decoded = self._zrle_decode(result, w, h)
+        return np.array_equal(decoded, orig)
+
+    def test_roundtrip_long_runs(self):
+        """Runs >= 129 identical pixels must use 8-bit ZRLE run lengths.
+        Regression test for TigerVNC 'ZRLE decode error' on full-screen updates."""
+        import numpy as np
+        from PIL import Image
+        arr = np.full((64, 64, 3), (200, 100, 50), dtype=np.uint8)
+        arr[63, :] = (10, 20, 30)  # one differing row -> run of 4032 px
+        self.assertTrue(self._roundtrip(Image.fromarray(arr)))
+
+    def test_roundtrip_solid_multitile(self):
+        import numpy as np
+        from PIL import Image
+        arr = np.full((128, 256, 3), (40, 80, 120), dtype=np.uint8)
+        self.assertTrue(self._roundtrip(Image.fromarray(arr)))
+
+    def test_roundtrip_gradient(self):
+        import numpy as np
+        from PIL import Image
+        arr = np.zeros((70, 100, 3), dtype=np.uint8)
+        for y in range(70):
+            for x in range(100):
+                arr[y, x] = ((x * 2) % 256, (y * 3) % 256, (x + y) % 256)
+        self.assertTrue(self._roundtrip(Image.fromarray(arr)))
 
 
 class TestTightEncoding(unittest.TestCase):
@@ -1723,6 +1845,299 @@ class TestPixelFormatChangeRace(unittest.TestCase):
                          "cursor is still being sent as a separate message "
                          "and the RealVNC race is back." % num_rects)
         self.assertEqual(srv.errors, [])
+
+
+class TestFileTransferController(unittest.TestCase):
+
+    def setUp(self):
+        import tempfile
+        from lib.filetransferctrl import FileTransferController
+        self.root = tempfile.mkdtemp(prefix='pyvncs_ft_')
+        self.ctrl = FileTransferController(root=self.root, enabled=True)
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    @staticmethod
+    def _ft_header(content_type, content_param=0, size=0, length=0):
+        return struct.pack('!BBBII', content_type, content_param, 0, size, length)
+
+    def _request_chunks(self, content_type, content_param=0, size=0, data=b''):
+        if isinstance(data, str):
+            data = data.encode()
+        chunks = [self._ft_header(content_type, content_param, size, len(data))]
+        if data:
+            chunks.append(data)
+        return chunks
+
+    @staticmethod
+    def _sock_with(chunks):
+        sock = Mock()
+        sock.recv.side_effect = list(chunks)
+        return sock
+
+    @staticmethod
+    def _sent(sock):
+        return [c.args[0] for c in sock.sendall.call_args_list]
+
+    @staticmethod
+    def _parse_ft(data):
+        msg_type, ct, cp, pad, size, length = struct.unpack('!BBBBII', data[:12])
+        return {
+            'type': msg_type, 'ct': ct, 'cp': cp, 'size': size,
+            'length': length, 'payload': data[12:12 + length],
+            'extra': data[12 + length:],
+        }
+
+    def test_pack_msg_format(self):
+        from lib.filetransferctrl import FileTransferController, FT_DIR_PACKET, A_FILE
+        msg = FileTransferController.pack_msg(FT_DIR_PACKET, A_FILE, 42, b'abc')
+        msg_type, ct, cp, pad, size, length = struct.unpack('!BBBBII', msg[:12])
+        self.assertEqual(msg_type, 7)
+        self.assertEqual(ct, FT_DIR_PACKET)
+        self.assertEqual(cp, A_FILE)
+        self.assertEqual(pad, 0)
+        self.assertEqual(size, 42)
+        self.assertEqual(length, 3)
+        self.assertEqual(msg[12:], b'abc')
+
+    def test_translate_path(self):
+        self.assertEqual(self.ctrl.translate_path('C:\\foo\\bar.txt'), 'foo/bar.txt')
+        self.assertEqual(self.ctrl.translate_path('/foo/bar'), 'foo/bar')
+        self.assertEqual(self.ctrl.translate_path('C:'), '')
+        self.assertEqual(self.ctrl.translate_path(''), '')
+
+    def test_resolve_confines_to_root(self):
+        inside = self.ctrl.resolve('sub/file.txt')
+        self.assertIsNotNone(inside)
+        self.assertTrue(inside.startswith(os.path.abspath(self.root) + os.sep))
+        self.assertEqual(self.ctrl.resolve(''), os.path.abspath(self.root))
+        self.assertIsNone(self.ctrl.resolve('../../etc/passwd'))
+        self.assertIsNone(self.ctrl.resolve('C:\\..\\..\\windows\\system32'))
+
+    def test_build_find_data_layout(self):
+        from lib.filetransferctrl import ATTR_DIRECTORY
+        data = self.ctrl.build_find_data('myfile', False, 1234, 0)
+        fields = struct.unpack('<IIIIIIIIIII', data[:44])
+        attrs, _cl, _ch, _al, _ah, _wl, _wh, size_high, size_low, _r0, _r1 = fields
+        self.assertEqual(len(data), 44 + len('myfile'))
+        self.assertEqual(data[44:], b'myfile')
+        self.assertEqual(size_low, 1234)
+        self.assertEqual(size_high, 0)
+        self.assertFalse(attrs & ATTR_DIRECTORY)
+
+        ddata = self.ctrl.build_find_data('mydir', True, 0, 0)
+        dattrs = struct.unpack('<I', ddata[:4])[0]
+        self.assertTrue(dattrs & ATTR_DIRECTORY)
+
+    def test_disabled_refuses(self):
+        from lib.filetransferctrl import FileTransferController, FT_FILE_TRANSFER_ACCESS
+        ctrl = FileTransferController(root=self.root, enabled=False)
+        sock = self._sock_with(self._request_chunks(FT_FILE_TRANSFER_ACCESS))
+        self.assertFalse(ctrl.handle_message(sock))
+        self.assertEqual(self._sent(sock), [])
+
+    def test_access_granted(self):
+        import lib.filetransferctrl as ftc
+        sock = self._sock_with(self._request_chunks(ftc.FT_FILE_TRANSFER_ACCESS))
+        self.assertTrue(self.ctrl.handle_message(sock))
+        sent = self._sent(sock)
+        self.assertEqual(len(sent), 1)
+        parsed = self._parse_ft(sent[0])
+        self.assertEqual(parsed['ct'], ftc.FT_FILE_TRANSFER_ACCESS)
+        self.assertEqual(parsed['size'], 1)
+
+    def test_drives_list(self):
+        import lib.filetransferctrl as ftc
+        chunks = self._request_chunks(ftc.FT_DIR_CONTENT_REQUEST, ftc.R_DRIVES_LIST)
+        sock = self._sock_with(chunks)
+        self.assertTrue(self.ctrl.handle_message(sock))
+        parsed = self._parse_ft(self._sent(sock)[0])
+        self.assertEqual(parsed['ct'], ftc.FT_DIR_PACKET)
+        self.assertEqual(parsed['cp'], ftc.A_DRIVES_LIST)
+        self.assertEqual(parsed['payload'], b'C:l\x00\x00')
+
+    def test_dir_listing(self):
+        import lib.filetransferctrl as ftc
+        os.mkdir(os.path.join(self.root, 'adir'))
+        with open(os.path.join(self.root, 'afile.txt'), 'w') as f:
+            f.write('hi')
+
+        chunks = self._request_chunks(ftc.FT_DIR_CONTENT_REQUEST, ftc.R_DIR_CONTENT, data='C:\\')
+        sock = self._sock_with(chunks)
+        self.assertTrue(self.ctrl.handle_message(sock))
+
+        packets = [self._parse_ft(s) for s in self._sent(sock)]
+        self.assertTrue(all(p['ct'] == ftc.FT_DIR_PACKET for p in packets))
+        self.assertEqual(packets[0]['payload'], b'C:\\')
+
+        names = []
+        for p in packets[1:-1]:
+            attrs = struct.unpack('<I', p['payload'][:4])[0]
+            name = p['payload'][44:].decode()
+            names.append((name, bool(attrs & ftc.ATTR_DIRECTORY)))
+        self.assertIn(('adir', True), names)
+        self.assertIn(('afile.txt', False), names)
+
+        terminator = packets[-1]
+        self.assertEqual(terminator['cp'], 0)
+        self.assertEqual(terminator['length'], 0)
+
+    def test_dir_listing_invalid_path(self):
+        import lib.filetransferctrl as ftc
+        chunks = self._request_chunks(ftc.FT_DIR_CONTENT_REQUEST, ftc.R_DIR_CONTENT, data='nope')
+        sock = self._sock_with(chunks)
+        self.assertTrue(self.ctrl.handle_message(sock))
+        packets = [self._parse_ft(s) for s in self._sent(sock)]
+        self.assertEqual(len(packets), 2)
+        self.assertEqual(packets[0]['payload'], b'nope')
+        self.assertEqual(packets[-1]['length'], 0)
+
+    def test_download(self):
+        import lib.filetransferctrl as ftc
+        content = b'X' * 20000
+        with open(os.path.join(self.root, 'big.bin'), 'wb') as f:
+            f.write(content)
+
+        chunks = self._request_chunks(ftc.FT_FILE_TRANSFER_REQUEST, data='big.bin')
+        go_ahead = struct.pack('!BBBBII', 7, ftc.FT_FILE_HEADER, 0, 0, 0, 0)
+        chunks.append(go_ahead)
+        sock = self._sock_with(chunks)
+        self.assertTrue(self.ctrl.handle_message(sock))
+
+        packets = [self._parse_ft(s) for s in self._sent(sock)]
+        header = packets[0]
+        self.assertEqual(header['ct'], ftc.FT_FILE_HEADER)
+        self.assertEqual(header['size'], len(content))
+        self.assertTrue(header['payload'].startswith(b'big.bin,'))
+        self.assertEqual(len(header['extra']), 4)
+
+        body = b''
+        for p in packets[1:]:
+            if p['ct'] == ftc.FT_FILE_PACKET:
+                self.assertEqual(p['size'], 0)
+                body += p['payload']
+        self.assertEqual(body, content)
+        self.assertEqual(packets[-1]['ct'], ftc.FT_END_OF_FILE)
+
+    def test_download_missing_file(self):
+        import lib.filetransferctrl as ftc
+        chunks = self._request_chunks(ftc.FT_FILE_TRANSFER_REQUEST, data='ghost.bin')
+        sock = self._sock_with(chunks)
+        self.assertTrue(self.ctrl.handle_message(sock))
+        header = self._parse_ft(self._sent(sock)[0])
+        self.assertEqual(header['ct'], ftc.FT_FILE_HEADER)
+        self.assertEqual(header['size'], 0xFFFFFFFF)
+
+    def test_upload(self):
+        import lib.filetransferctrl as ftc
+        offer = self._request_chunks(ftc.FT_FILE_TRANSFER_OFFER, size=11, data='up.txt,01/01/2020 00:00')
+        offer.append(struct.pack('!I', 0))
+        self.assertTrue(self.ctrl.handle_message(self._sock_with(offer)))
+
+        packet = self._request_chunks(ftc.FT_FILE_PACKET, size=0, data=b'hello world')
+        self.assertTrue(self.ctrl.handle_message(self._sock_with(packet)))
+        self.assertTrue(self.ctrl.handle_message(self._sock_with(self._request_chunks(ftc.FT_END_OF_FILE))))
+
+        with open(os.path.join(self.root, 'up.txt'), 'rb') as f:
+            self.assertEqual(f.read(), b'hello world')
+
+    def test_upload_compressed(self):
+        import zlib
+        import lib.filetransferctrl as ftc
+        offer = self._request_chunks(ftc.FT_FILE_TRANSFER_OFFER, size=100, data='z.bin,ts')
+        offer.append(struct.pack('!I', 0))
+        self.assertTrue(self.ctrl.handle_message(self._sock_with(offer)))
+
+        raw = b'compressed payload ' * 10
+        packet = self._request_chunks(ftc.FT_FILE_PACKET, size=1, data=zlib.compress(raw))
+        self.assertTrue(self.ctrl.handle_message(self._sock_with(packet)))
+        self.assertTrue(self.ctrl.handle_message(self._sock_with(self._request_chunks(ftc.FT_END_OF_FILE))))
+
+        with open(os.path.join(self.root, 'z.bin'), 'rb') as f:
+            self.assertEqual(f.read(), raw)
+
+    def test_upload_offer_accept_header(self):
+        import lib.filetransferctrl as ftc
+        offer = self._request_chunks(ftc.FT_FILE_TRANSFER_OFFER, size=5, data='a.txt,ts')
+        offer.append(struct.pack('!I', 0))
+        sock = self._sock_with(offer)
+        self.assertTrue(self.ctrl.handle_message(sock))
+        accept = self._parse_ft(self._sent(sock)[0])
+        self.assertEqual(accept['ct'], ftc.FT_FILE_ACCEPT_HEADER)
+        self.assertEqual(accept['size'], 0)
+        self.ctrl._close_upload()
+
+    def test_command_mkdir(self):
+        import lib.filetransferctrl as ftc
+        chunks = self._request_chunks(ftc.FT_COMMAND, ftc.C_DIR_CREATE, data='newdir')
+        sock = self._sock_with(chunks)
+        self.assertTrue(self.ctrl.handle_message(sock))
+        resp = self._parse_ft(self._sent(sock)[0])
+        self.assertEqual(resp['ct'], ftc.FT_COMMAND_RETURN)
+        self.assertEqual(resp['cp'], ftc.A_DIR_CREATE)
+        self.assertEqual(resp['size'], 0)
+        self.assertTrue(os.path.isdir(os.path.join(self.root, 'newdir')))
+
+    def test_command_delete(self):
+        import lib.filetransferctrl as ftc
+        target = os.path.join(self.root, 'del.txt')
+        open(target, 'w').close()
+        chunks = self._request_chunks(ftc.FT_COMMAND, ftc.C_FILE_DELETE, data='del.txt')
+        sock = self._sock_with(chunks)
+        self.assertTrue(self.ctrl.handle_message(sock))
+        resp = self._parse_ft(self._sent(sock)[0])
+        self.assertEqual(resp['cp'], ftc.A_FILE_DELETE)
+        self.assertEqual(resp['size'], 0)
+        self.assertFalse(os.path.exists(target))
+
+    def test_command_rename(self):
+        import lib.filetransferctrl as ftc
+        src = os.path.join(self.root, 'old.txt')
+        open(src, 'w').close()
+        chunks = self._request_chunks(ftc.FT_COMMAND, ftc.C_FILE_RENAME, data='old.txt*new.txt')
+        sock = self._sock_with(chunks)
+        self.assertTrue(self.ctrl.handle_message(sock))
+        resp = self._parse_ft(self._sent(sock)[0])
+        self.assertEqual(resp['cp'], ftc.A_FILE_RENAME)
+        self.assertEqual(resp['size'], 0)
+        self.assertTrue(os.path.exists(os.path.join(self.root, 'new.txt')))
+        self.assertFalse(os.path.exists(src))
+
+    def test_command_traversal_blocked(self):
+        import lib.filetransferctrl as ftc
+        chunks = self._request_chunks(ftc.FT_COMMAND, ftc.C_DIR_CREATE, data='../../evil')
+        sock = self._sock_with(chunks)
+        self.assertTrue(self.ctrl.handle_message(sock))
+        resp = self._parse_ft(self._sent(sock)[0])
+        self.assertEqual(resp['size'], ftc.R_ERROR_CMD)
+        self.assertFalse(os.path.isdir(os.path.join(self.root, '..', '..', 'evil')))
+
+    def test_unknown_command(self):
+        import lib.filetransferctrl as ftc
+        chunks = self._request_chunks(ftc.FT_COMMAND, 99, data='x')
+        sock = self._sock_with(chunks)
+        self.assertTrue(self.ctrl.handle_message(sock))
+        resp = self._parse_ft(self._sent(sock)[0])
+        self.assertEqual(resp['ct'], ftc.FT_COMMAND_RETURN)
+        self.assertEqual(resp['size'], ftc.R_ERROR_CMD)
+
+
+class TestFileTransferServerWiring(unittest.TestCase):
+
+    def test_default_disabled(self):
+        server = VNCServer(socket=Mock(), password='pw', auth_type=2, vnc_config=None)
+        self.assertFalse(server._file_transfer_enabled)
+        self.assertIsNone(server._file_transfer_root)
+
+    def test_enabled_from_config(self):
+        cfg = Mock()
+        cfg.file_transfer = True
+        cfg.file_transfer_root = '/tmp/ft-root'
+        server = VNCServer(socket=Mock(), password='pw', auth_type=2, vnc_config=cfg)
+        self.assertTrue(server._file_transfer_enabled)
+        self.assertEqual(server._file_transfer_root, '/tmp/ft-root')
 
 
 if __name__ == '__main__':

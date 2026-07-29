@@ -147,6 +147,15 @@ def main(argv):
                         help="Scale factor for framebuffer (e.g. 0.5 for half resolution)",
                         required=False, type=float, default=1.0,
                         dest="scale")
+    parser.add_argument("--file-transfer",
+                        help="Enable file transfer (UltraVNC/TightVNC extension). "
+                             "SECURITY: exposes filesystem access confined to --file-transfer-root.",
+                        required=False, action='store_true',
+                        dest="file_transfer")
+    parser.add_argument("--file-transfer-root",
+                        help="Sandbox root directory for file transfer. Default: user home.",
+                        required=False, type=str, default='',
+                        dest="file_transfer_root")
     parser.add_argument("--list-encodings",
                         help="List available encodings and exit",
                         action='store_true', dest="list_encodings")
@@ -227,6 +236,8 @@ def main(argv):
     vnc_config.fps = max(1, min(120, args.fps))
     vnc_config.no_cursor = args.no_cursor
     vnc_config.scale = args.scale
+    vnc_config.file_transfer = args.file_transfer
+    vnc_config.file_transfer_root = args.file_transfer_root
 
     sockServer = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sockServer.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
