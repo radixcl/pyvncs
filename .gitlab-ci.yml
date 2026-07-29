@@ -3,19 +3,16 @@ stages:
 
 mirror_github:
   stage: mirror
-  only:
-    - devel
-    - master
-    - experimental
-    - merge_requests
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "devel"'
+    - if: '$CI_COMMIT_BRANCH == "master"'
+    - if: '$CI_COMMIT_BRANCH == "experimental"'
   script:
     - git remote add github "https://x-access-token:${GITHUB_TOKEN}@github.com/radixcl/pyvncs.git" 2>/dev/null || true
     - git fetch github 2>/dev/null || true
-    - for branch in devel master experimental feat/performance-and-wayland; do
+    - for branch in devel master experimental; do
         if git show-ref --verify --quiet "refs/heads/$branch"; then
           git push github "refs/heads/$branch" 2>&1 || echo "Failed to push $branch to GitHub"
         fi
       done
-  variables:
-    GITHUB_TOKEN: ""
 
