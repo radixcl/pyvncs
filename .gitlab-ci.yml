@@ -10,10 +10,10 @@ mirror_github:
   script:
     - |
       git remote add github "https://x-access-token:${GITHUB_TOKEN}@github.com/radixcl/pyvncs.git" 2>/dev/null || true
-      git fetch github 2>/dev/null || true
+      git fetch origin
       for branch in devel master experimental; do
-        if git show-ref --verify --quiet "refs/heads/$branch"; then
-          git push github "refs/heads/$branch" 2>&1 || echo "Failed to push $branch to GitHub"
+        if git show-ref --verify --quiet "refs/remotes/origin/$branch"; then
+          git push github "refs/remotes/origin/$branch:refs/heads/$branch" 2>&1 || echo "Failed to push $branch"
         fi
       done
 
