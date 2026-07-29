@@ -26,11 +26,7 @@ class HextileEncoding:
         self._last_fg = None  # wire-format bytes of last foreground pixel
 
     def _image_to_wire(self, image, bpp):
-        """Convert a PIL RGB image to a (h, w, bpp_bytes) uint8 array in wire format.
-
-        The channel layout matches what the raw encoding produces so that all
-        encodings are interchangeable.
-        """
+        """Convert image (PIL or numpy) to a (h, w, bpp_bytes) uint8 array in wire format."""
         arr = np.asarray(image)
         if arr.ndim == 2:
             arr = arr.reshape(arr.shape[0], arr.shape[1], 1)

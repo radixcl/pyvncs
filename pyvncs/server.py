@@ -116,6 +116,10 @@ class VNCServer():
         self.fbupdate_rate_limit = 1.0 / max(1, fps)
         self._bw_estimator = _BandwidthEstimator()
         self._no_cursor = bool(getattr(vnc_config, 'no_cursor', False)) if vnc_config else False
+        try:
+            self._scale = float(vnc_config.scale) if vnc_config else 1.0
+        except (TypeError, ValueError, AttributeError):
+            self._scale = 1.0
 
         log.debug("Configured auth type:", self.auth_type)
 
@@ -135,6 +139,34 @@ class VNCServer():
                     u, p = entry.split(':', 1)
                     userlist[u] = p
         return userlist
+
+    def _reselect_encoding(self):
+        client_has_zrle2 = 24 in self.client_encodings
+        for e in encs.common.encodings_priority:
+            if e not in encs.common.encodings:
+                continue
+            if e not in self.client_encodings:
+                continue
+            if not encs.common.encodings[e].enabled:
+                continue
+            if self.bpp <= 8 and e in (ENCODINGS.tight, ENCODINGS.zrle):
+                continue
+            if client_has_zrle2 and e in (ENCODINGS.tight, ENCODINGS.zrle, ENCODINGS.hextile):
+                continue
+            if self.encoding == e:
+                return
+            self.encoding = e
+            log.debug("Selected %s encoding (bpp=%d)" % (encs.common.encodings[e].name, self.bpp))
+            self.encoding_object = encs.common.encodings[e]()
+            if hasattr(self.encoding_object, '_jpeg_quality'):
+                self.encoding_object._jpeg_quality = self.vnc_config.jpeg_quality
+            if hasattr(self.encoding_object, '_compression_level'):
+                self.encoding_object._compression_level = self.vnc_config.compression_level
+                if hasattr(self.encoding_object, '_streams'):
+                    self.encoding_object._streams = [self.encoding_object._new_stream() for _ in range(4)]
+                elif hasattr(self.encoding_object, '_comp'):
+                    self.encoding_object._comp = self.encoding_object._new_stream()
+            return
 
     def __del__(self):
         log.debug("VncServer died")
@@ -354,6 +386,9 @@ class VNCServer():
         else:
             width, height = screen.size
         del screen
+        if self._scale != 1.0:
+            width = int(width * self._scale)
+            height = int(height * self._scale)
         self.width = width
         self.height = height
         bpp = 32    # FIXME: get real bpp
@@ -463,34 +498,56 @@ class VNCServer():
                 if b == 0:  # SetPixelFormat
                     fbur_data = sock.recv(19, socket.MSG_WAITALL)
                     log.debug("Client Message Type: Set Pixel Format (0)")
-                    (self.bpp, self.depth, self.bigendian, self.truecolor, self.red_maximum,
-                     self.green_maximum, self.blue_maximum,
-                     self.red_shift, self.green_shift, self.blue_shift
+                    (bpp, depth, bigendian, truecolor, red_maximum,
+                     green_maximum, blue_maximum,
+                     red_shift, green_shift, blue_shift
                      ) = unpack("!xxxBBBBHHHBBBxxx", fbur_data)
-                    log.debug("IMG bpp, depth, endian, truecolor", self.bpp, self.depth, self.bigendian, self.truecolor)
-                    log.debug("SHIFTS", self.red_shift, self.green_shift, self.blue_shift)
-                    log.debug("MAXS", self.red_maximum, self.green_maximum, self.blue_maximum)
+                    log.debug("IMG bpp, depth, endian, truecolor", bpp, depth, bigendian, truecolor)
+                    log.debug("SHIFTS", red_shift, green_shift, blue_shift)
+                    log.debug("MAXS", red_maximum, green_maximum, blue_maximum)
 
-                    # When red_shift > blue_shift the wire format stores blue in
-                    # the low byte and red in the high byte (BGR order), so
-                    # rfb_bitmap must swap channels ("bgr").
-                    self.primaryOrder = "bgr" if self.red_shift > self.blue_shift else "rgb"
+                    # Hold _sock_write_lock so the FB-sender thread cannot be
+                    # mid-flight in send_rectangles() while we mutate the pixel
+                    # format / encoding.  Without this, RealVNC's rapid
+                    # "FBUpdateRequest + SetPixelFormat" burst races with the
+                    # sender and emits a FramebufferUpdate whose rect header
+                    # (encoding id) and payload (encoded bytes) come from
+                    # different format generations, desyncing the client.
+                    with self._sock_write_lock:
+                        self.bpp = bpp
+                        self.depth = depth
+                        self.bigendian = bigendian
+                        self.truecolor = truecolor
+                        self.red_maximum = red_maximum
+                        self.green_maximum = green_maximum
+                        self.blue_maximum = blue_maximum
+                        self.red_shift = red_shift
+                        self.green_shift = green_shift
+                        self.blue_shift = blue_shift
 
-                    self.rfb_bitmap.bpp = self.bpp
-                    self.rfb_bitmap.depth = self.depth
-                    self.rfb_bitmap.dither = self.vnc_config.eightbitdither
-                    self.rfb_bitmap.primaryOrder = self.primaryOrder
-                    self.rfb_bitmap.truecolor = self.truecolor
-                    self.rfb_bitmap.red_shift = self.red_shift
-                    self.rfb_bitmap.green_shift = self.green_shift
-                    self.rfb_bitmap.blue_shift = self.blue_shift
-                    self.rfb_bitmap.red_maximum = self.red_maximum
-                    self.rfb_bitmap.green_maximum = self.green_maximum
-                    self.rfb_bitmap.blue_maximum = self.blue_maximum
-                    self.rfb_bitmap.bigendian = self.bigendian
+                        # When red_shift > blue_shift the wire format stores blue in
+                        # the low byte and red in the high byte (BGR order), so
+                        # rfb_bitmap must swap channels ("bgr").
+                        self.primaryOrder = "bgr" if self.red_shift > self.blue_shift else "rgb"
 
-                    if self.bpp == 8:
-                        self.primaryOrder = "bgr"
+                        self.rfb_bitmap.bpp = self.bpp
+                        self.rfb_bitmap.depth = self.depth
+                        self.rfb_bitmap.dither = self.vnc_config.eightbitdither
+                        self.rfb_bitmap.primaryOrder = self.primaryOrder
+                        self.rfb_bitmap.truecolor = self.truecolor
+                        self.rfb_bitmap.red_shift = self.red_shift
+                        self.rfb_bitmap.green_shift = self.green_shift
+                        self.rfb_bitmap.blue_shift = self.blue_shift
+                        self.rfb_bitmap.red_maximum = self.red_maximum
+                        self.rfb_bitmap.green_maximum = self.green_maximum
+                        self.rfb_bitmap.blue_maximum = self.blue_maximum
+                        self.rfb_bitmap.bigendian = self.bigendian
+
+                        if self.bpp == 8:
+                            self.primaryOrder = "bgr"
+
+                        if self.client_encodings:
+                            self._reselect_encoding()
 
                     log.debug("Using order:", self.primaryOrder)
 
@@ -500,43 +557,22 @@ class VNCServer():
                     (nencodings,) = unpack("!xH", fbur_data)
                     log.debug("SetEncoding: total encodings", repr(nencodings))
                     fbur_data = sock.recv(4 * nencodings, socket.MSG_WAITALL)
-                    self.client_encodings = unpack("!%si" % nencodings, fbur_data)
-                    log.debug("client_encodings", repr(self.client_encodings), len(self.client_encodings))
+                    new_encodings = unpack("!%si" % nencodings, fbur_data)
+                    log.debug("client_encodings", repr(new_encodings), len(new_encodings))
 
-                    self.cursor_support = False
-                    if not self._no_cursor and ENCODINGS.cursor in self.client_encodings:
-                        log.debug("client cursor support")
-                        self.cursor_encoding = CursorEncoding()
-                        self.cursor_support = True
+                    # Same lock discipline as SetPixelFormat: the FB-sender
+                    # thread reads self.client_encodings / self.encoding_object
+                    # from inside send_rectangles(), so we must not swap them
+                    # underneath it.
+                    with self._sock_write_lock:
+                        self.client_encodings = new_encodings
+                        self.cursor_support = False
+                        if not self._no_cursor and ENCODINGS.cursor in self.client_encodings:
+                            log.debug("client cursor support")
+                            self.cursor_encoding = CursorEncoding()
+                            self.cursor_support = True
 
-                    log.debug("encs.common.encodings_priority", encs.common.encodings_priority)
-                    selected = False
-                    for e in encs.common.encodings_priority:
-                        if e not in encs.common.encodings:
-                            continue
-                        if e in self.client_encodings:
-                            if self.encoding == e:
-                                selected = True
-                                break
-                            if not encs.common.encodings[e].enabled:
-                                log.debug("Encoding disabled:", e)
-                                continue
-                            self.encoding = e
-                            log.debug("Using %s encoding" % encs.common.encodings[self.encoding].name)
-                            self.encoding_object = encs.common.encodings[self.encoding]()
-                            if hasattr(self.encoding_object, '_jpeg_quality'):
-                                self.encoding_object._jpeg_quality = self.vnc_config.jpeg_quality
-                            if hasattr(self.encoding_object, '_compression_level'):
-                                self.encoding_object._compression_level = self.vnc_config.compression_level
-                                self.encoding_object._streams = [self.encoding_object._new_stream() for _ in range(4)]
-                            selected = True
-                            break
-
-                    if not selected:
-                        log.debug("No matching encoding found, falling back to raw (0)")
-                        log.debug("Client encodings:", self.client_encodings)
-                        if 0 not in self.client_encodings:
-                            log.error("Client does not support raw encoding (0) - connection may fail")
+                        self._reselect_encoding()
 
                 elif b == 3:  # FBUpdateRequest — hand off to sender thread
                     fbur_data = sock.recv(9, socket.MSG_WAITALL)
@@ -618,20 +654,23 @@ class VNCServer():
             last_fbur = time.time()
 
             try:
+                # Hold _sock_write_lock for the whole send so that
+                # SetPixelFormat / SetEncodings (which now also take this
+                # lock) cannot mutate self.bpp / self.encoding_object
+                # mid-flight.  The cursor rect is built inside
+                # send_rectangles() and emitted in the *same*
+                # FramebufferUpdate as the framebuffer pixels, so a client
+                # that swaps pixel format right after receiving the FB
+                # update never gets a separate cursor message in the wrong
+                # format (RealVNC's "invalid message type N" bug).
                 with self._sock_write_lock:
                     self.send_rectangles(self.socket, x, y, w, h, incremental)
             except Exception as e:
+                import traceback
                 log.debug("FB sender error: %s" % e)
+                log.debug("Traceback:\n%s" % traceback.format_exc())
                 self._running = False
                 break
-
-            if self.cursor_support:
-                try:
-                    with self._sock_write_lock:
-                        self.send_cursor(x, y)
-                except Exception as e:
-                    log.debug("Cursor send error (disabling): %s" % e)
-                    self.cursor_support = False
 
             # Adaptive rate-limit adjustment
             sent_bytes = getattr(self, '_last_sent_bytes', 0)
@@ -659,10 +698,20 @@ class VNCServer():
             return False
 
         if isinstance(scr, np.ndarray):
+            if self._scale != 1.0:
+                from PIL import Image as _Img
+                sh, sw = scr.shape[:2]
+                img = _Img.fromarray(scr)
+                img = img.resize((int(sw * self._scale), int(sh * self._scale)), _Img.LANCZOS)
+                scr = np.asarray(img)
             return scr[y:y+h, x:x+w].copy()
 
         if scr.mode != "RGB":
             scr = scr.convert("RGB")
+
+        if self._scale != 1.0:
+            sw, sh = scr.size
+            scr = scr.resize((int(sw * self._scale), int(sh * self._scale)), Image.LANCZOS)
 
         crop = scr.crop((x, y, x + w, y + h))
         del scr
@@ -695,36 +744,20 @@ class VNCServer():
             return arr.tobytes()
 
     def send_cursor(self, x, y):
-        cursor_img = self.cursor_encoding.get_cursor_image()
-        if cursor_img is None:
-            return False
+        """Public wrapper: send the cursor as a stand-alone FramebufferUpdate.
 
-        if self.last_cursor == cursor_img:
+        Kept for backwards compatibility (and for callers that need to push
+        a cursor update outside the regular FB-update path).  The regular
+        path now embeds the cursor inside send_rectangles() so that a
+        SetPixelFormat arriving between the two cannot desync the client.
+        """
+        rect_bytes = self._build_cursor_rect_bytes()
+        if not rect_bytes:
             return True
-
-        w, h = cursor_img.size
-        self.last_cursor = cursor_img
-
-        if cursor_img.mode != "RGBA":
-            cursor_img = cursor_img.convert("RGBA")
-
-        bitmap = self.rfb_bitmap
-        rgb = bitmap.get_bitmap(cursor_img)
-        raw_pixels = self._encode_cursor_pixels(rgb)
-
-        alpha = np.asarray(cursor_img)[:, :, 3]
-        row_bytes = (w + 7) // 8
-        pad_w = row_bytes * 8
-        padded = np.zeros((h, pad_w), dtype=np.uint8)
-        padded[:, :w] = (alpha > 0).astype(np.uint8)
-        bitmask = np.packbits(padded, axis=1).tobytes()
 
         sendbuff = bytearray()
         sendbuff.extend(pack("!BxH", 0, 1))       # FramebufferUpdate, 1 rect
-        sendbuff.extend(pack("!HHHH", 0, 0, w, h)) # hotspot (0,0), cursor size
-        sendbuff.extend(pack("!i", -239))           # cursor pseudo-encoding
-        sendbuff.extend(raw_pixels)
-        sendbuff.extend(bitmask)
+        sendbuff.extend(rect_bytes)
 
         try:
             self.socket.sendall(sendbuff)
@@ -734,14 +767,90 @@ class VNCServer():
 
         return True
 
+    def _build_cursor_rect_bytes(self):
+        """Build a single cursor pseudo-encoding rect (NO FramebufferUpdate
+        header).  Returns b'' if the cursor is unchanged or unavailable.
+
+        Embedding the cursor rect inside the same FramebufferUpdate as the
+        framebuffer rect (see send_rectangles) is what makes the connection
+        robust to SetPixelFormat: the client sees the cursor and the FB
+        pixels in one atomic message, both in the *same* pixel format, so
+        there is no window in which the client could be reading bytes of
+        the cursor with the wrong bytes-per-pixel.
+        """
+        if not self.cursor_support:
+            return b''
+
+        try:
+            cursor_img = self.cursor_encoding.get_cursor_image()
+            if cursor_img is None:
+                return b''
+            if self.last_cursor == cursor_img:
+                return b''
+
+            w, h = cursor_img.size
+            self.last_cursor = cursor_img
+
+            if cursor_img.mode != "RGBA":
+                cursor_img = cursor_img.convert("RGBA")
+
+            bitmap = self.rfb_bitmap
+            rgb = bitmap.get_bitmap(cursor_img)
+            raw_pixels = self._encode_cursor_pixels(rgb)
+
+            alpha = np.asarray(cursor_img)[:, :, 3]
+            row_bytes = (w + 7) // 8
+            pad_w = row_bytes * 8
+            padded = np.zeros((h, pad_w), dtype=np.uint8)
+            padded[:, :w] = (alpha > 0).astype(np.uint8)
+            bitmask = np.packbits(padded, axis=1).tobytes()
+
+            out = bytearray()
+            out.extend(pack("!HHHH", 0, 0, w, h))  # hotspot (0,0), cursor size
+            out.extend(pack("!i", -239))            # cursor pseudo-encoding
+            out.extend(raw_pixels)
+            out.extend(bitmask)
+            return bytes(out)
+        except Exception as e:
+            import traceback
+            log.debug("Cursor rect build error: %s" % e)
+            log.debug("Traceback:\n%s" % traceback.format_exc())
+            self.cursor_support = False
+            return b''
+
 
     def send_rectangles(self, sock, x, y, w, h, incremental=0):
         # send FramebufferUpdate to client
 
+        # Configure rfb_bitmap with the current pixel format FIRST, before
+        # any pixel data is produced.  _build_cursor_rect_bytes() relies on
+        # bitmap.bpp being set; if we leave it unset (or stale from a
+        # previous format), get_bitmap() returns None and the cursor encode
+        # crashes with "not enough values to unpack (expected 2, got 0)".
+        bitmap = self.rfb_bitmap
+        bitmap.bpp = self.bpp
+        bitmap.depth = self.depth
+        bitmap.dither = self.vnc_config.eightbitdither
+        bitmap.primaryOrder = self.primaryOrder
+        bitmap.truecolor = self.truecolor
+        bitmap.red_shift = self.red_shift
+        bitmap.green_shift = self.green_shift
+        bitmap.blue_shift = self.blue_shift
+
+        # Optionally build the cursor rect first.  Doing this BEFORE
+        # anything else (and inside the same _sock_write_lock critical
+        # section that the caller holds) lets us emit the cursor and the
+        # framebuffer pixels as a *single* FramebufferUpdate, eliminating
+        # the race where SetPixelFormat would mutate self.bpp between the
+        # two separate messages (RealVNC's "invalid message type N" bug).
+        cursor_rect = self._build_cursor_rect_bytes()
+
         # Guard against zero-dimension requests
         if w <= 0 or h <= 0:
             try:
-                sock.sendall(pack("!BxH", 0, 0))
+                sock.sendall(pack("!BxH", 0, 1 if cursor_rect else 0))
+                if cursor_rect:
+                    sock.sendall(cursor_rect)
             except Exception:
                 return False
             return
@@ -762,8 +871,13 @@ class VNCServer():
             if arr_new.shape == arr_old.shape:
                 mask = np.any(arr_new != arr_old, axis=2) if arr_new.ndim == 3 else (arr_new != arr_old)
                 if not mask.any():
-                    rectangles = 0
-                    sendbuff.extend(pack("!BxH", 0, rectangles))
+                    # No FB changes, but we may still need to ship a cursor
+                    # rect that became dirty.  Emit a FramebufferUpdate with
+                    # exactly the cursor rect (or zero rects if neither).
+                    num = 1 if cursor_rect else 0
+                    sendbuff.extend(pack("!BxH", 0, num))
+                    if cursor_rect:
+                        sendbuff.extend(cursor_rect)
                     sleep(0.05)
                     try:
                         sock.sendall(sendbuff)
@@ -785,32 +899,41 @@ class VNCServer():
                 x, y = x + int(x0), y + int(y0)
 
         if self.bpp == 32 or self.bpp == 16 or self.bpp == 8:
-            bitmap = self.rfb_bitmap
-            bitmap.bpp = self.bpp
-            bitmap.depth = self.depth
-            bitmap.dither = self.vnc_config.eightbitdither
-            bitmap.primaryOrder = self.primaryOrder
-            bitmap.truecolor = self.truecolor
-            bitmap.red_shift = self.red_shift
-            bitmap.green_shift = self.green_shift
-            bitmap.blue_shift = self.blue_shift
-
             self.encoding_object.framebuffer = self.framebuffer
             if self.encoding == ENCODINGS.tight:
                 self.encoding_object.primaryOrder = 'rgb'
                 if not isinstance(rectangle, np.ndarray):
                     rectangle = np.asarray(rectangle)
-                sendbuff.extend(self.encoding_object.send_image(x, y, w, h, rectangle, self.bpp, self.depth))
+                fb_bytes = self.encoding_object.send_image(x, y, w, h, rectangle, self.bpp, self.depth)
             else:
                 if isinstance(rectangle, np.ndarray):
                     rectangle = Image.fromarray(rectangle, 'RGB')
                 image = bitmap.get_bitmap(rectangle)
                 self.encoding_object.primaryOrder = self.primaryOrder
-                sendbuff.extend(self.encoding_object.send_image(x, y, w, h, image, self.bpp, self.depth))
+                fb_bytes = self.encoding_object.send_image(x, y, w, h, image, self.bpp, self.depth)
         else:
             log.debug("[!] Unsupported BPP: %s" % self.bpp)
+            fb_bytes = b''
 
         self.framebuffer = lastshot
+
+        # send_image() returns a complete FramebufferUpdate message
+        # (header + one or more rects).  We strip its 4-byte header and
+        # re-emit our own so that we can append the cursor rect and bump
+        # num_rects accordingly.  encodings like Tight already produce
+        # multiple rects; we account for that here.
+        if fb_bytes:
+            num_fb_rects = unpack('!H', fb_bytes[2:4])[0]
+            fb_rect_bytes = fb_bytes[4:]
+        else:
+            num_fb_rects = 0
+            fb_rect_bytes = b''
+
+        total_rects = num_fb_rects + (1 if cursor_rect else 0)
+        sendbuff.extend(pack("!BxH", 0, total_rects))
+        sendbuff.extend(fb_rect_bytes)
+        if cursor_rect:
+            sendbuff.extend(cursor_rect)
 
         # Send the entire framebuffer update in one shot.  The socket is in
         # blocking mode (settimeout(None)), so sendall blocks until the OS

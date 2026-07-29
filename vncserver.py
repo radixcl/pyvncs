@@ -93,7 +93,7 @@ def main(argv):
                         )
     parser.add_argument("-P", "--vncpassword",
                         help="Sets VNC password. For VeNCrypt: user:pass or user:pass;user2:pass2",
-                        required=True, dest="vnc_password")
+                        required=False, dest="vnc_password")
     parser.add_argument("-C", "--cert-file",
                         help="SSL PEM certificate file for VeNCrypt TLS. Auto-generated if missing.",
                         required=False,
@@ -147,20 +147,45 @@ def main(argv):
                         help="Scale factor for framebuffer (e.g. 0.5 for half resolution)",
                         required=False, type=float, default=1.0,
                         dest="scale")
+    parser.add_argument("--list-encodings",
+                        help="List available encodings and exit",
+                        action='store_true', dest="list_encodings")
 
     args = parser.parse_args()
 
-    # Set env vars BEFORE importing pyvncs (which imports lib.encodings)
-    if args.disabled_encodings:
-        os.environ['PYVNCS_DISABLED_ENCODINGS'] = args.disabled_encodings.lower()
-    if args.only_encodings:
-        os.environ['PYVNCS_ONLY_ENCODINGS'] = args.only_encodings.lower()
+    if args.list_encodings:
+        import lib.encodings
+        from lib.encodings.common import encodings
+        print("Available encodings (for use with -e / -E):")
+        for eid in sorted(encodings, key=lambda k: encodings[k].id):
+            cls = encodings[eid]
+            if getattr(cls, 'pseudoEncoding', False) or cls.id < 0:
+                continue
+            print("  %-10s %s (id=%d)" % (cls.name, cls.description, cls.id))
+        sys.exit(0)
+
+    if not args.vnc_password:
+        parser.error("-P/--vncpassword is required")
 
     # Configure log level before anything else
     log.set_level(args.log_level)
 
-    # Now import pyvncs (encodings will respect the env var)
-    import pyvncs
+    # Filter encodings based on CLI args
+    from lib.encodings.common import encodings, encodings_priority
+    if args.only_encodings:
+        allowed = [e.strip() for e in args.only_encodings.lower().split(',') if e.strip()]
+        for eid in list(encodings):
+            cls = encodings[eid]
+            if cls.name.lower() not in allowed and eid != 0:
+                del encodings[eid]
+        encodings_priority[:] = [e for e in encodings_priority if e in encodings]
+    elif args.disabled_encodings:
+        disabled = [e.strip() for e in args.disabled_encodings.lower().split(',') if e.strip()]
+        for eid in list(encodings):
+            cls = encodings[eid]
+            if cls.name.lower() in disabled and eid != 0:
+                del encodings[eid]
+        encodings_priority[:] = [e for e in encodings_priority if e in encodings]
 
     if args.outfile is not None:
         try:

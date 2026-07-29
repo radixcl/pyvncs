@@ -99,10 +99,10 @@ class ClipboardController():
             with self._lock:
                 self._last_clipboard = server_text
 
-            # Send ServerCutText (message type 7)
+            # Send ServerCutText (RFB 6143 §7.6.4 message-type 3)
             text_bytes = server_text.encode('iso8859-1')
             sendbuff = bytearray()
-            sendbuff.append(7)  # ServerCutText
+            sendbuff.append(3)  # ServerCutText
             sendbuff.extend(b'\x00\x00\x00')  # padding
             sendbuff.extend(pack('!I', len(text_bytes)))
             sendbuff.extend(text_bytes)

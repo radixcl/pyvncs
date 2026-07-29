@@ -1462,5 +1462,268 @@ class TestTightEncoding(unittest.TestCase):
         self.assertEqual(palette_size_byte, 1)
 
 
+class TestPixelFormatChangeRace(unittest.TestCase):
+    """Regression test for the RealVNC disconnect bug.
+
+    RealVNC's "Quality Selector" fires ``FBUpdateRequest`` + ``SetPixelFormat``
+    in quick succession when upgrading from 8 bpp rgb222 to 32 bpp rgb888.
+    The FB-sender thread ran ``send_rectangles`` concurrently with the input
+    thread mutating ``self.bpp`` / ``self.encoding_object``, producing a
+    FramebufferUpdate whose rect header and payload belonged to different
+    format generations.  The client then read payload bytes as the next
+    message-type and disconnected with ``Protocol error: invalid message
+    type N`` (N was effectively random — observed as 49, 120, etc.).
+    """
+
+    AUTH_PASSWORD = 'testpass'
+
+    @staticmethod
+    def _make_fake_screen():
+        return Image.new('RGB', (320, 240), (40, 80, 120))
+
+    @staticmethod
+    def _mirror_key_bits(password):
+        pw = (password + '\0' * 8)[:8]
+        key = []
+        for ch in pw:
+            b = ord(ch); r = 0
+            for i in range(8):
+                if b & (1 << i):
+                    r |= (1 << (7 - i))
+            key.append(r)
+        return key
+
+    def _do_handshake(self, cs):
+        ver = cs.recv(12); cs.send(ver)
+        n = struct.unpack('B', cs.recv(1))[0]
+        cs.recv(n); cs.send(struct.pack('B', 2))
+        from pyDes import des
+        challenge = cs.recv(16)
+        cs.send(des(self._mirror_key_bits(self.AUTH_PASSWORD)).encrypt(challenge))
+        struct.unpack('!I', cs.recv(4))[0]
+        cs.send(struct.pack('B', 1))
+        hdr = cs.recv(24)
+        fb_w, fb_h = struct.unpack('!HH', hdr[:4])
+        name_len = struct.unpack('!I', hdr[20:24])[0]
+        cs.recv(name_len)
+        return fb_w, fb_h
+
+    class _ServerRunner:
+        def __init__(self, test_case, slow_send=False):
+            self.tc = test_case
+            self.slow_send = slow_send
+            self.listen_sock = None
+            self.thread = None
+            self.errors = []
+            self.client_sock = None
+            self._race_holder = {'observed': False}
+
+        def __enter__(self):
+            self.listen_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.listen_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.listen_sock.bind(('127.0.0.1', 0))
+            self.listen_sock.listen(1)
+            port = self.listen_sock.getsockname()[1]
+
+            ready = threading.Event()
+
+            def _serve():
+                try:
+                    conn, _ = self.listen_sock.accept()
+                    ready.set()
+
+                    class Cfg:
+                        auth_type = 2
+                        vnc_password = self.tc.AUTH_PASSWORD
+                        pem_file = ''
+                        eightbitdither = False
+                        win_title = 'race-test'
+                        jpeg_quality = 50
+                        compression_level = 1
+                        scale = 1.0
+                        fps = 20
+                        no_cursor = False
+
+                    import pyvncs.server
+
+                    if self.slow_send:
+                        orig = pyvncs.server.VNCServer.send_rectangles
+                        holder = self._race_holder
+
+                        def slow(self, sock, x, y, w, h, incremental=0):
+                            entry = (self.bpp, self.depth, self.encoding,
+                                     type(self.encoding_object).__name__)
+                            time.sleep(0.3)  # widen the race window
+                            exit_ = (self.bpp, self.depth, self.encoding,
+                                     type(self.encoding_object).__name__)
+                            if entry != exit_:
+                                holder['observed'] = True
+                            return orig(self, sock, x, y, w, h, incremental)
+
+                        pyvncs.server.VNCServer.send_rectangles = slow
+
+                    srv = pyvncs.server.VNCServer(
+                        conn, auth_type=2, password=self.tc.AUTH_PASSWORD,
+                        vnc_config=Cfg(),
+                    )
+                    with patch.object(pyvncs.server, 'ImageGrab') as mock:
+                        mock.grab.return_value = self.tc._make_fake_screen()
+                        if not srv.init():
+                            self.errors.append('init failed')
+                            return
+                        srv.handle_client()
+                except Exception as exc:
+                    self.errors.append(repr(exc))
+                finally:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+
+            self.thread = threading.Thread(target=_serve, daemon=True)
+            self.thread.start()
+
+            self.client_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.client_sock.settimeout(5)
+            for _ in range(50):
+                try:
+                    self.client_sock.connect(('127.0.0.1', port))
+                    break
+                except (ConnectionRefusedError, OSError):
+                    time.sleep(0.05)
+            ready.wait(timeout=3)
+            return self
+
+        def __exit__(self, *exc):
+            try:
+                if self.client_sock:
+                    self.client_sock.close()
+            except Exception:
+                pass
+            try:
+                if self.listen_sock:
+                    self.listen_sock.close()
+            except Exception:
+                pass
+            self.thread.join(timeout=5)
+            return False
+
+    @staticmethod
+    def _set_encodings(cs, encs):
+        msg = struct.pack('!BxH', 2, len(encs))
+        for e in encs:
+            msg += struct.pack('!i', e)
+        cs.send(msg)
+
+    @staticmethod
+    def _set_pixel_format(cs, bpp, depth, rmax, gmax, bmax,
+                          rshift, gshift, bshift):
+        cs.send(struct.pack('!BxxxBBBBHHHBBBxxx', 0, bpp, depth, 0, 1,
+                            rmax, gmax, bmax, rshift, gshift, bshift))
+
+    @staticmethod
+    def _fb_update_request(cs, incremental, x, y, w, h):
+        cs.send(struct.pack('!BBHHHH', 3, incremental, x, y, w, h))
+
+    def test_setpixelformat_does_not_race_with_fb_sender(self):
+        """SetPixelFormat arriving during an in-flight FBUpdate must not
+        mutate state underneath the FB-sender thread.
+
+        Before the fix, the FB sender observed ``bpp=8/Hextile`` on entry
+        and ``bpp=32/ZRLE`` on exit, producing a corrupt FramebufferUpdate
+        that desynced the client (the RealVNC "invalid message type N" bug).
+        """
+        with self._ServerRunner(self, slow_send=True) as srv:
+            cs = srv.client_sock
+            fb_w, fb_h = self._do_handshake(cs)
+
+            # Configure as RealVNC does: ZRLE + Hextile + Raw
+            self._set_encodings(cs, [16, 5, 0])
+            time.sleep(0.1)
+
+            # Start in 8 bpp rgb222 (RealVNC's low-quality initial mode)
+            self._set_pixel_format(cs, 8, 6, 3, 3, 3, 0, 2, 4)
+            time.sleep(0.1)
+
+            # FBUpdateRequest + SetPixelFormat(32bpp) in one burst — this is
+            # exactly what RealVNC's Quality Selector does when upgrading.
+            burst = b''
+            burst += struct.pack('!BBHHHH', 3, 0, 0, 0, fb_w, fb_h)
+            burst += struct.pack('!BxxxBBBBHHHBBBxxx', 0, 32, 24, 0, 1,
+                                 255, 255, 255, 16, 8, 0)
+            cs.sendall(burst)
+
+            # Give the server time to process both messages under the slow path
+            time.sleep(1.5)
+
+            # Drain any FB output
+            cs.settimeout(0.5)
+            try:
+                while cs.recv(65536):
+                    pass
+            except (socket.timeout, OSError):
+                pass
+
+        self.assertFalse(srv._race_holder['observed'],
+                         "SetPixelFormat raced with send_rectangles(): the FB "
+                         "sender observed different bpp/encoding on entry vs "
+                         "exit. This is the RealVNC disconnect bug.")
+        self.assertEqual(srv.errors, [],
+                         "server should not have raised: %s" % srv.errors)
+
+    def test_cursor_and_fb_in_same_framebuffer_update(self):
+        """The cursor rect must be embedded in the *same* FramebufferUpdate
+        as the framebuffer rect.
+
+        Previously, send_cursor was called as a second FramebufferUpdate
+        AFTER send_rectangles.  When a client (RealVNC) sent SetPixelFormat
+        between those two messages, the cursor was sent in the new pixel
+        format while the client was still expecting the old one, causing
+        a stream desync ("Protocol error: invalid message type N").
+
+        Now both rects travel in one FramebufferUpdate so they share the
+        pixel format atomically.
+        """
+        with self._ServerRunner(self, slow_send=False) as srv:
+            cs = srv.client_sock
+            fb_w, fb_h = self._do_handshake(cs)
+
+            # Client advertises cursor pseudo-encoding so cursor_support=True
+            self._set_encodings(cs, [16, -239, 0])
+            time.sleep(0.1)
+
+            # Start at 8 bpp
+            self._set_pixel_format(cs, 8, 6, 3, 3, 3, 0, 2, 4)
+            time.sleep(0.1)
+
+            # Request a small update — server should respond with one
+            # FramebufferUpdate containing BOTH the FB rect and the cursor.
+            self._fb_update_request(cs, 0, 0, 0, 32, 32)
+            time.sleep(0.6)
+
+            cs.settimeout(0.5)
+            all_data = b''
+            try:
+                while True:
+                    c = cs.recv(65536)
+                    if not c: break
+                    all_data += c
+            except (socket.timeout, OSError):
+                pass
+
+        # The very first byte is the message type; bytes 2-3 are num_rects
+        self.assertGreaterEqual(len(all_data), 4)
+        self.assertEqual(all_data[0], 0,
+                         "first message must be a FramebufferUpdate, "
+                         "got msg_type=%d (stream desynced)" % all_data[0])
+        num_rects = struct.unpack('!H', all_data[2:4])[0]
+        self.assertEqual(num_rects, 2,
+                         "FB and cursor must be in the SAME FramebufferUpdate "
+                         "(num_rects=2); got num_rects=%d. If num_rects=1 the "
+                         "cursor is still being sent as a separate message "
+                         "and the RealVNC race is back." % num_rects)
+        self.assertEqual(srv.errors, [])
+
+
 if __name__ == '__main__':
     unittest.main()

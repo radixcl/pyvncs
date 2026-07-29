@@ -54,17 +54,21 @@ class RfbBitmap():
 
         elif self.bpp == 8:
             image = rectangle.convert('RGB')
-            if self.primaryOrder == "bgr":
-                (r, g, b) = image.split()
-                image = Image.merge("RGB", (b, g, r))
-                del b, g, r
+            a = np.array(image).astype(np.uint16)
 
-            a = np.array(image)
-            r = (a[..., 0] >> 5) & 0x07
-            g = (a[..., 1] >> 2) & 0x07
-            b = (a[..., 2] >> 5) & 0x07
-            bgr233 = (b << 6) | (g << 3) | r
-            image = Image.fromarray(bgr233.astype('uint8'), 'P')
+            r_max = getattr(self, 'red_maximum', 7) or 7
+            g_max = getattr(self, 'green_maximum', 7) or 7
+            b_max = getattr(self, 'blue_maximum', 3) or 3
+            r_shift = getattr(self, 'red_shift', 0) or 0
+            g_shift = getattr(self, 'green_shift', 3) or 3
+            b_shift = getattr(self, 'blue_shift', 6) or 6
+
+            rq = (a[..., 0] * r_max // 255).astype(np.uint8)
+            gq = (a[..., 1] * g_max // 255).astype(np.uint8)
+            bq = (a[..., 2] * b_max // 255).astype(np.uint8)
+
+            packed = (rq << r_shift) | (gq << g_shift) | (bq << b_shift)
+            image = Image.fromarray(packed.astype('uint8'), 'P')
             image.putpalette(bgr233_palette.palette)
             return image
 
