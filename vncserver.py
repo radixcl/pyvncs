@@ -25,29 +25,39 @@ class ClientThread(Thread):
         self.ip = ip
         self.port = port
         self.sock = sock
-        self.setDaemon(True)
+        self.daemon = True
         self.vnc_config = vnc_config
-
 
     def __del__(self):
         _debug("ClientThread died")
 
     def run(self):
         _debug("[+] New server socket thread started for " + self.ip + ":" + str(self.port))
-        server = pyvncs.server.VNCServer(self.sock,
-                                        auth_type=self.vnc_config.auth_type,
-                                        password=self.vnc_config.vnc_password,
-                                        pem_file=self.vnc_config.pem_file,
-                                        vnc_config=self.vnc_config
-                                        )
-        #server.vnc_config.eightbitdither = self.vnc_config.eightbitdither
-        status = server.init()
+        server = None
+        try:
+            server = pyvncs.server.VNCServer(self.sock,
+                                            auth_type=self.vnc_config.auth_type,
+                                            password=self.vnc_config.vnc_password,
+                                            pem_file=self.vnc_config.pem_file,
+                                            vnc_config=self.vnc_config
+                                            )
+            status = server.init()
 
-        if not status:
-            _debug("Error negotiating client init")
-            return False
-        
-        server.handle_client()
+            if not status:
+                _debug("Error negotiating client init")
+                return
+
+            server.handle_client()
+
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as e:
+            _debug("ClientThread exception: %s" % e)
+        finally:
+            try:
+                self.sock.close()
+            except Exception:
+                pass
 
 
 def main(argv):
@@ -179,16 +189,12 @@ def main(argv):
         sockServer.listen(4)
         (conn, (ip,port)) = sockServer.accept()
         newthread = ClientThread(sock=conn, ip=ip, port=port, vnc_config=vnc_config)
-        newthread.setDaemon(True)
         newthread.start()
 
 
-if __name__ == "__main__2":
+if __name__ == "__main__":
     try:
         main(sys.argv)
-    except KeyboardInterrupt as e:
+    except KeyboardInterrupt:
         _debug("Exiting on ctrl+c...")
-        sys.exit()
-
-if __name__ == "__main__":
-    main(sys.argv)
+        sys.exit(0)

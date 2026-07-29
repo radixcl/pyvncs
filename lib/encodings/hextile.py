@@ -1,8 +1,7 @@
 from . import common
 from lib import log
-from struct import *
-from PIL import Image
-import zlib
+from struct import pack
+import numpy as np
 
 
 class HextileEncoding:
@@ -23,129 +22,91 @@ class HextileEncoding:
 
     def __init__(self):
         log.debug("Initialized", __name__)
-        self._last_bg = None
-        self._last_fg = None
-        self.bpp = 4  # server uses 32 bpp
+        self._last_bg = None  # wire-format bytes of last background pixel
+        self._last_fg = None  # wire-format bytes of last foreground pixel
 
-    def send_image(self, x, y, w, h, image):
+    def _image_to_wire(self, image, bpp):
+        """Convert a PIL RGB image to a (h, w, bpp_bytes) uint8 array in wire format.
+
+        The channel layout matches what the raw encoding produces so that all
+        encodings are interchangeable.
+        """
+        arr = np.asarray(image)
+        if arr.ndim == 2:
+            arr = arr.reshape(arr.shape[0], arr.shape[1], 1)
+        h, w = arr.shape[:2]
+
+        if bpp == 32:
+            out = np.zeros((h, w, 4), dtype=np.uint8)
+            out[:, :, :3] = arr[:, :, :3]
+            return out
+        elif bpp == 16:
+            r = arr[:, :, 0].astype(np.uint16)
+            g = arr[:, :, 1].astype(np.uint16)
+            b = arr[:, :, 2].astype(np.uint16)
+            rr = (r >> 3) & 0x1F
+            gg = (g >> 2) & 0x3F
+            bb = (b >> 3) & 0x1F
+            val = (bb << 11) | (gg << 5) | rr
+            out = np.zeros((h, w, 2), dtype=np.uint8)
+            out[:, :, 0] = val & 0xFF
+            out[:, :, 1] = (val >> 8) & 0xFF
+            return out
+        else:  # 8 bpp
+            return arr.reshape(h, w, 1).copy()
+
+    def send_image(self, x, y, w, h, image, bpp=32, depth=24):
         sendbuff = bytearray()
-        rectangles = 1
-        sendbuff.extend(pack("!BxH", 0, rectangles))
+        sendbuff.extend(pack("!BxH", 0, 1))  # FramebufferUpdate, 1 rect
         sendbuff.extend(pack("!HHHH", x, y, w, h))
         sendbuff.extend(pack(">i", self.id))
 
-        if self.framebuffer and self.framebuffer.mode not in ('RGBA', 'RGBX'):
-            self.framebuffer = self.framebuffer.convert('RGBX')
+        bpp_bytes = (bpp + 7) // 8
+        pixels = self._image_to_wire(image, bpp)  # (h, w, bpp_bytes)
 
-        for ty in range(y, y + h, self.TILE_SIZE):
-            for tx in range(x, x + w, self.TILE_SIZE):
-                tw = min(self.TILE_SIZE, x + w - tx)
-                th = min(self.TILE_SIZE, y + h - ty)
-
-                if self.framebuffer:
-                    tile = self.framebuffer.crop((tx, ty, tx + tw, ty + th))
-                else:
-                    tile = image.crop((tx, ty, tx + tw, ty + th))
-
-                sendbuff.extend(self.encode_tile(tile, tw, th))
+        for ty in range(0, h, self.TILE_SIZE):
+            for tx in range(0, w, self.TILE_SIZE):
+                tw = min(self.TILE_SIZE, w - tx)
+                th = min(self.TILE_SIZE, h - ty)
+                tile = pixels[ty:ty + th, tx:tx + tw]
+                sendbuff.extend(self._encode_tile(tile, bpp_bytes))
 
         return sendbuff
 
-    def encode_tile(self, tile, tw, th):
+    def _encode_tile(self, tile, bpp_bytes):
+        """Encode a single 16×16 (or smaller) tile.
+
+        Strategy (correct and simple):
+          - Solid tile  → BackgroundSpecified (with carry-over optimization)
+          - Anything else → Raw
+        """
         encoded = bytearray()
-        pixels = list(tile.getdata())
-        n_pixels = tw * th
+        flat = np.ascontiguousarray(tile).reshape(-1, bpp_bytes)
 
-        if len(pixels) == 0:
-            return encoded
+        # View each pixel as a single void record for fast uniqueness check
+        rec = np.ascontiguousarray(flat).view(
+            np.dtype((np.void, bpp_bytes))
+        )
+        unique, counts = np.unique(rec, return_counts=True)
 
-        # Determine background and check for solid-color tile
-        bg = pixels[0]
-        all_solid = all(p == bg for p in pixels)
-
-        if all_solid:
-            # Solid tile: just specify background (or carry over)
-            subenc = self.BG_SPECIFIED
+        if len(unique) == 1:
+            # ---- Solid tile ----
+            bg_bytes = flat[0].tobytes()
+            subenc = 0
+            if bg_bytes != self._last_bg:
+                subenc |= self.BG_SPECIFIED
             encoded.append(subenc)
-            if not self._bg_carried():
-                encoded.extend(self.pack_pixel(bg))
-            self._last_bg = bg
+            if subenc & self.BG_SPECIFIED:
+                encoded.extend(bg_bytes)
+            self._last_bg = bg_bytes
             self._last_fg = None
             return encoded
 
-        # Not solid — check if we can use a foreground color for most pixels
-        fg_candidates = {}
-        for p in pixels:
-            fg_candidates[p] = fg_candidates.get(p, 0) + 1
-        # Find most common non-background color
-        fg_candidates.pop(bg, None)
-        if fg_candidates:
-            most_common = max(fg_candidates, key=fg_candidates.get)
-            most_common_count = fg_candidates[most_common]
-        else:
-            most_common = bg
-            most_common_count = 0
-
-        # Use RRE-style if a non-background color covers >30% of tile
-        if most_common_count > n_pixels * 0.3 and most_common != bg:
-            subenc = self.BG_SPECIFIED | self.ANY_SUBRECTS
-            encoded.append(subenc)
-            if not self._bg_carried():
-                encoded.extend(self.pack_pixel(bg))
-            if most_common != bg and not self._fg_carried(exclude=bg):
-                encoded.extend(self.pack_pixel(most_common))
-                subenc = self.BG_SPECIFIED | self.FG_SPECIFIED | self.ANY_SUBRECTS
-                encoded[0] = subenc
-            else:
-                pass  # fg carried or same as bg
-
-            self._last_bg = bg
-            self._last_fg = most_common if most_common != bg else None
-
-            # Build subrectangles for pixels different from foreground
-            non_fg_pixels = [(i, p) for i, p in enumerate(pixels) if p != most_common]
-            if not self._fg_carried(exclude=bg) and len(non_fg_pixels) > 0:
-                encoded.append(len(non_fg_pixels))
-
-            for idx, color in non_fg_pixels:
-                iy = idx // tw
-                ix = idx % tw
-                # x and y in 4-bit fields
-                xy_byte = (ix << 4) | iy
-                # width and height are always 1 for single-pixel subrects
-                wh_byte = 0  # width-1 = 0, height-1 = 0
-                encoded.append(xy_byte)
-                encoded.append(wh_byte)
-                if subenc & self.SUBRECTS_COLORED or (self._fg_carried(exclude=bg) is False):
-                    encoded.extend(self.pack_pixel(color))
-        else:
-            # Fall back to raw
-            subenc = self.RAW
-            encoded.append(subenc)
-            encoded.extend(tile.tobytes())
-            self._last_bg = None
-            self._last_fg = None
-
+        # ---- Non-solid: fall back to raw ----
+        encoded.append(self.RAW)
+        encoded.extend(tile.tobytes())
+        # background/foreground carry is unchanged by a raw tile
         return encoded
-
-    def pack_pixel(self, pixel):
-        if isinstance(pixel, tuple):
-            if len(pixel) >= 3:
-                r, g, b = pixel[0], pixel[1], pixel[2]
-                if len(pixel) == 4:
-                    return pack("!BBBB", r, g, b, pixel[3])
-                return pack("!BBBx", r, g, b)
-            elif len(pixel) == 1:
-                return pack("!BBBB", pixel[0], 0, 0, 0)
-        return pack("!BBBB", 0, 0, 0, 0)
-
-    def _bg_carried(self):
-        return self._last_bg is not None
-
-    def _fg_carried(self, exclude=None):
-        if exclude is not None:
-            return self._last_fg is not None and self._last_fg != exclude
-        return self._last_fg is not None
 
 
 common.encodings[common.ENCODINGS.hextile] = HextileEncoding

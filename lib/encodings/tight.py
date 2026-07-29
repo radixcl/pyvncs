@@ -23,7 +23,7 @@ class Encoding:
         )
         self._last_compression_was_jpeg = False
 
-    def send_image(self, x, y, w, h, image):
+    def send_image(self, x, y, w, h, image, bpp=32, depth=24):
         sendbuff = bytearray()
 
         if image.mode == 'RGBX' or image.mode == 'RGBA':

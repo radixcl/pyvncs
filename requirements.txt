@@ -7,6 +7,7 @@ PyGObject; sys_platform == "linux"
 dbus-python; sys_platform == "linux"
 cryptography
 cffi
+evdev; sys_platform == "linux"
 
 # Dependencias del sistema requeridas para Wayland (no se instalan con pip):
 #   gst-plugins-base-1.0   (appsink, videoconvert)

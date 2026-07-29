@@ -285,6 +285,11 @@ class VeNCrypt():
 
             log.debug(__name__, "TLS handshake completed")
 
+            # All further I/O (auth_plain, _send_auth_result) must go through
+            # the encrypted channel — swap self.sock so auth_plain reads from
+            # the SSL socket instead of the now-wrapped plain socket.
+            self.sock = self.ssl_socket
+
             # Run plain auth over the encrypted channel
             ret = self.auth_plain(userlist)
 

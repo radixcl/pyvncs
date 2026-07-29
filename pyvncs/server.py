@@ -25,6 +25,7 @@ import socket
 import errno
 import numpy as np
 import time
+import threading
 
 from lib import mousectrl
 from lib import kbdctrl
@@ -326,7 +327,14 @@ class VNCServer():
 
 
     def handle_client(self):
-        self.socket.settimeout(None)    # set nonblocking socket
+        """Main input loop.
+
+        Runs in the **input thread**: reads client messages and dispatches them.
+        Keyboard/mouse events are processed immediately so they stay responsive
+        even while a large framebuffer update is being sent in the background
+        by :meth:`_fb_sender_loop`.
+        """
+        self.socket.settimeout(None)
 
         self._mouse_controller = mousectrl.MouseController()
         self._kbd_controller = kbdctrl.KeyboardController()
@@ -335,236 +343,233 @@ class VNCServer():
         self.primaryOrder = "bgr"
         self.encoding = ENCODINGS.raw
         self.encoding_object = encs.common.encodings[self.encoding]()
+        self.client_encodings = []
 
+        # -- Thread coordination ------------------------------------------------
+        # _sock_write_lock:  serialises socket writes between input thread
+        #                     (clipboard sync) and FB sender thread.
+        # _fb_event / _fb_pending:  latest-update-wins hand-off from input
+        #                           thread to FB sender.
+        self._sock_write_lock = threading.Lock()
+        self._fb_event = threading.Event()
+        self._fb_pending = None
+        self._fb_pending_lock = threading.Lock()
+        self._running = True
 
         sock = self.socket
-        last_fbur = time.time()
         last_clipboard_sync = 0.0
 
-        while True:
+        fb_thread = threading.Thread(
+            target=self._fb_sender_loop, name='fb-sender', daemon=True
+        )
+        fb_thread.start()
 
+        while self._running:
             try:
-                data = sock.recv(1) # read first byte
+                data = sock.recv(1)
             except socket.timeout:
-                #log.debug("timeout")
                 continue
             except socket.error as e:
                 err = e.args[0]
-                # no data
-                if err == errno.EAGAIN or err == errno.EWOULDBLOCK:
+                if err in (errno.EAGAIN, errno.EWOULDBLOCK):
                     continue
             except Exception as e:
                 log.debug("exception '%s'" % e)
-                sock.close()
                 break
 
             if not data:
-                # clinet disconnected
-                sock.close()
                 break
-
-            if data[0] == 0: # client SetPixelFormat
-                fbur_data = sock.recv(19, socket.MSG_WAITALL)
-                log.debug("Client Message Type: Set Pixel Format (0)")
-                (self.bpp, self.depth, self.bigendian, self.truecolor, self.red_maximum,
-                 self.green_maximum, self.blue_maximum,
-                 self.red_shift, self.green_shift, self.blue_shift
-                 ) = unpack("!xxxBBBBHHHBBBxxx", fbur_data)
-                log.debug("IMG bpp, depth, endian, truecolor", self.bpp, self.depth, self.bigendian, self.truecolor)
-                log.debug("SHIFTS", self.red_shift, self.green_shift, self.blue_shift)
-                log.debug("MAXS", self.red_maximum, self.green_maximum, self.blue_maximum)
-
-                # Configure primaryOrder
-                self.primaryOrder = "rgb" if self.red_shift > self.blue_shift else "bgr"
-
-                # rfb_bitmap common config
-                self.rfb_bitmap.bpp = self.bpp
-                self.rfb_bitmap.depth = self.depth
-                self.rfb_bitmap.dither = self.vnc_config.eightbitdither
-                self.rfb_bitmap.primaryOrder = self.primaryOrder
-                self.rfb_bitmap.truecolor = self.truecolor
-                self.rfb_bitmap.red_shift = self.red_shift
-                self.rfb_bitmap.green_shift = self.green_shift
-                self.rfb_bitmap.blue_shift = self.blue_shift
-                self.rfb_bitmap.red_maximum = self.red_maximum
-                self.rfb_bitmap.green_maximum = self.green_maximum
-                self.rfb_bitmap.blue_maximum = self.blue_maximum
-                self.rfb_bitmap.bigendian = self.bigendian
-
-                # fixed bpp for 8 bpp
-                if self.bpp == 8:
-                    self.primaryOrder = "bgr"  # assume BGR for 8 bpp
-                
-                log.debug("Using order:", self.primaryOrder)
-
-                continue
-            
-            if data[0] == 2: # SetEncoding
-                fbur_data = sock.recv(3)
-                log.debug("Client Message Type: SetEncoding (2)")
-                (nencodings,) = unpack("!xH", fbur_data)
-                log.debug("SetEncoding: total encodings", repr(nencodings))
-                fbur_data = sock.recv(4 * nencodings, socket.MSG_WAITALL)
-                #log.debug("len", len(data2))
-                self.client_encodings = unpack("!%si" % nencodings, fbur_data)
-                log.debug("client_encodings", repr(self.client_encodings), len(self.client_encodings))
-
-                # cursor support?
-                self.cursor_support = False
-                if ENCODINGS.cursor in self.client_encodings:
-                    log.debug("client cursor support")
-                    self.cursor_encoding = CursorEncoding()
-                    self.cursor_support = True
-
-                # which pixel encoding to use?
-                log.debug("encs.common.encodings_priority", encs.common.encodings_priority)
-                selected = False
-                for e in encs.common.encodings_priority:
-                    if e not in encs.common.encodings:
-                        continue
-                    if e in self.client_encodings:
-                        if self.encoding == e:
-                            # don't initialize same encoding again
-                            selected = True
-                            break
-                        # check if encoding is disabled
-                        if not encs.common.encodings[e].enabled:
-                            log.debug("Encoding disabled:", e)
-                            continue
-                        self.encoding = e
-                        #log.debug("Using %s encoding" % self.encoding)
-                        log.debug("Using %s encoding" % encs.common.encodings[self.encoding].name)
-                        self.encoding_object = encs.common.encodings[self.encoding]()
-                        selected = True
-                        break
-
-                if not selected:
-                    log.debug("No matching encoding found, falling back to raw (0)")
-                    log.debug("Client encodings:", self.client_encodings)
-                    if 0 not in self.client_encodings:
-                        log.error("Client does not support raw encoding (0) - connection may fail")
-
-                continue
-
-
-            if data[0] == 3: # FBUpdateRequest
-                # rate limit (adaptive)
-                fbur_data = sock.recv(9, socket.MSG_WAITALL)
-                if not fbur_data:
-                    log.debug("connection closed?")
-                    break
-                elapsed = time.time() - last_fbur
-                if elapsed < self.fbupdate_rate_limit:
-                    # rate limited — send empty update and let estimator run
-                    try:
-                        sock.sendall(pack("!BxH", 0, 0))
-                    except Exception as e:
-                        log.debug(f"Error sending rate limited FBUpdateRequest: {str(e)}")
-                        break
-                    continue
-
-                last_fbur = time.time()
-                (incremental, x, y, w, h) = unpack("!BHHHH", fbur_data)
-                self.send_rectangles(sock, x, y, w, h, incremental)
-                if self.cursor_support:
-                    self.send_cursor(x, y)
-
-                # Drain any input that arrived while we were sending
-                try:
-                    extra = sock.recv(4096)
-                    if extra:
-                        self._process_pending_input(sock, extra, self._mouse_controller, self._kbd_controller, self._clipboard_controller)
-                except (BlockingIOError, OSError):
-                    pass
-
-                # Update bandwidth estimator with what was just sent
-                self._bw_estimator.record_send(self._last_sent_bytes)
-                # Adjust rate limit based on throughput
-                bps = self._bw_estimator.current_bps
-                if bps > 0:
-                    frame_budget = (bps * self.fbupdate_rate_limit) / 8
-                    # If we're well under the budget, speed up; else slow down
-                    ratio = self._last_sent_bytes / max(frame_budget, 1)
-                    if ratio < 0.5:
-                        self.fbupdate_rate_limit = max(
-                            self.fbupdate_min_interval,
-                            self.fbupdate_rate_limit * 0.9
-                        )
-                    elif ratio > 1.5:
-                        self.fbupdate_rate_limit = min(
-                            self.fbupdate_max_interval,
-                            self.fbupdate_rate_limit * 1.1
-                        )
-                continue
-                
-
-            if data[0] == 4:    # keyboard event
-                self._kbd_controller.process_event(sock.recv(7))
-                continue
-
-            if data[0] == 5:    # PointerEvent
-                x, y, _ = self._mouse_controller.process_event(sock.recv(5, socket.MSG_WAITALL))
-                continue
-
-            if data[0] == 6:    # ClientCutText
-                text = self._clipboard_controller.client_cut_text(sock)
-                log.debug("ClientCutText:", text)
-
-            else:
-                fbur_data = sock.recv(4096)
-                log.debug("RAW Server received data:", repr(data[0]) , data+fbur_data)
 
             # Periodic clipboard sync (server -> client)
             now = time.time()
             if now - last_clipboard_sync >= self._clipboard_controller.sync_interval:
                 last_clipboard_sync = now
-                self._clipboard_controller.maybe_send_clipboard(sock)
+                try:
+                    with self._sock_write_lock:
+                        self._clipboard_controller.maybe_send_clipboard(sock)
+                except Exception as e:
+                    log.debug("Clipboard sync error: %s" % e)
 
-    def _process_pending_input(self, sock, data, mc, kc, cc):
-        """Parse and dispatch any pending RFB input messages from *data*."""
-        buf = data
-        while len(buf) >= 1:
-            msg_type = buf[0]
-            needed = 0
-            if msg_type == 0:   # SetPixelFormat
-                needed = 20
-            elif msg_type == 2: # SetEncoding
-                if len(buf) < 3:
-                    break
-                (nenc,) = unpack("!xH", buf[:3])
-                needed = 3 + 4 * nenc
-            elif msg_type == 3: # FBUpdateRequest
-                needed = 9
-            elif msg_type == 4: # keyboard
-                needed = 7
-            elif msg_type == 5: # PointerEvent
-                needed = 5
-            elif msg_type == 6: # ClientCutText
-                if len(buf) < 4:
-                    break
-                (ln,) = unpack("!I", buf[1:5])
-                needed = 4 + ln
-            else:
-                # Unknown — skip one byte to avoid infinite loop
-                buf = buf[1:]
+            b = data[0]
+
+            try:
+                if b == 0:  # SetPixelFormat
+                    fbur_data = sock.recv(19, socket.MSG_WAITALL)
+                    log.debug("Client Message Type: Set Pixel Format (0)")
+                    (self.bpp, self.depth, self.bigendian, self.truecolor, self.red_maximum,
+                     self.green_maximum, self.blue_maximum,
+                     self.red_shift, self.green_shift, self.blue_shift
+                     ) = unpack("!xxxBBBBHHHBBBxxx", fbur_data)
+                    log.debug("IMG bpp, depth, endian, truecolor", self.bpp, self.depth, self.bigendian, self.truecolor)
+                    log.debug("SHIFTS", self.red_shift, self.green_shift, self.blue_shift)
+                    log.debug("MAXS", self.red_maximum, self.green_maximum, self.blue_maximum)
+
+                    # When red_shift > blue_shift the wire format stores blue in
+                    # the low byte and red in the high byte (BGR order), so
+                    # rfb_bitmap must swap channels ("bgr").
+                    self.primaryOrder = "bgr" if self.red_shift > self.blue_shift else "rgb"
+
+                    self.rfb_bitmap.bpp = self.bpp
+                    self.rfb_bitmap.depth = self.depth
+                    self.rfb_bitmap.dither = self.vnc_config.eightbitdither
+                    self.rfb_bitmap.primaryOrder = self.primaryOrder
+                    self.rfb_bitmap.truecolor = self.truecolor
+                    self.rfb_bitmap.red_shift = self.red_shift
+                    self.rfb_bitmap.green_shift = self.green_shift
+                    self.rfb_bitmap.blue_shift = self.blue_shift
+                    self.rfb_bitmap.red_maximum = self.red_maximum
+                    self.rfb_bitmap.green_maximum = self.green_maximum
+                    self.rfb_bitmap.blue_maximum = self.blue_maximum
+                    self.rfb_bitmap.bigendian = self.bigendian
+
+                    if self.bpp == 8:
+                        self.primaryOrder = "bgr"
+
+                    log.debug("Using order:", self.primaryOrder)
+
+                elif b == 2:  # SetEncoding
+                    fbur_data = sock.recv(3)
+                    log.debug("Client Message Type: SetEncoding (2)")
+                    (nencodings,) = unpack("!xH", fbur_data)
+                    log.debug("SetEncoding: total encodings", repr(nencodings))
+                    fbur_data = sock.recv(4 * nencodings, socket.MSG_WAITALL)
+                    self.client_encodings = unpack("!%si" % nencodings, fbur_data)
+                    log.debug("client_encodings", repr(self.client_encodings), len(self.client_encodings))
+
+                    self.cursor_support = False
+                    if ENCODINGS.cursor in self.client_encodings:
+                        log.debug("client cursor support")
+                        self.cursor_encoding = CursorEncoding()
+                        self.cursor_support = True
+
+                    log.debug("encs.common.encodings_priority", encs.common.encodings_priority)
+                    selected = False
+                    for e in encs.common.encodings_priority:
+                        if e not in encs.common.encodings:
+                            continue
+                        if e in self.client_encodings:
+                            if self.encoding == e:
+                                selected = True
+                                break
+                            if not encs.common.encodings[e].enabled:
+                                log.debug("Encoding disabled:", e)
+                                continue
+                            self.encoding = e
+                            log.debug("Using %s encoding" % encs.common.encodings[self.encoding].name)
+                            self.encoding_object = encs.common.encodings[self.encoding]()
+                            selected = True
+                            break
+
+                    if not selected:
+                        log.debug("No matching encoding found, falling back to raw (0)")
+                        log.debug("Client encodings:", self.client_encodings)
+                        if 0 not in self.client_encodings:
+                            log.error("Client does not support raw encoding (0) - connection may fail")
+
+                elif b == 3:  # FBUpdateRequest — hand off to sender thread
+                    fbur_data = sock.recv(9, socket.MSG_WAITALL)
+                    if not fbur_data or len(fbur_data) < 9:
+                        log.debug("connection closed during FBUpdateRequest")
+                        break
+                    (incremental, x, y, w, h) = unpack("!BHHHH", fbur_data)
+                    with self._fb_pending_lock:
+                        self._fb_pending = (incremental, x, y, w, h)
+                    self._fb_event.set()
+
+                elif b == 4:  # keyboard event — process immediately
+                    self._kbd_controller.process_event(
+                        sock.recv(7, socket.MSG_WAITALL))
+
+                elif b == 5:  # PointerEvent — process immediately
+                    self._mouse_controller.process_event(
+                        sock.recv(5, socket.MSG_WAITALL))
+
+                elif b == 6:  # ClientCutText
+                    text = self._clipboard_controller.client_cut_text(sock)
+                    log.debug("ClientCutText:", text)
+
+                else:
+                    fbur_data = sock.recv(4096)
+                    log.debug("RAW Server received data:", repr(b), data + fbur_data)
+
+            except Exception as e:
+                log.debug("Input dispatch error (msg type %d): %s" % (b, e))
+
+        # -- shutdown -----------------------------------------------------------
+        self._running = False
+        self._fb_event.set()
+        fb_thread.join(timeout=3)
+        self._kbd_controller.close()
+        try:
+            sock.close()
+        except Exception:
+            pass
+
+    def _fb_sender_loop(self):
+        """Framebuffer sender thread.
+
+        Waits for FBUpdateRequest signals from the input thread, then captures
+        the screen, encodes, and sends the update.  Because this runs in a
+        separate thread, a slow send never blocks keyboard/mouse processing.
+        """
+        last_fbur = 0.0
+
+        while self._running:
+            if not self._fb_event.wait(timeout=1):
+                continue
+            self._fb_event.clear()
+
+            if not self._running:
+                break
+
+            with self._fb_pending_lock:
+                item = self._fb_pending
+                self._fb_pending = None
+            if item is None:
                 continue
 
-            if len(buf) < needed:
-                break
-            chunk = buf[:needed]
-            buf = buf[needed:]
+            incremental, x, y, w, h = item
 
-            if msg_type == 4:
+            # Rate-limit incremental updates only
+            if incremental and (time.time() - last_fbur) < self.fbupdate_rate_limit:
                 try:
-                    kc.process_event(chunk)
-                except Exception:
-                    pass
-            elif msg_type == 5:
-                try:
-                    mc.process_event(chunk)
-                except Exception:
-                    pass
-            # ClientCutText (type 6) is handled by the main loop; skip in drain
+                    with self._sock_write_lock:
+                        self.socket.sendall(pack("!BxH", 0, 0))
+                except Exception as e:
+                    log.debug("Error sending rate-limited response: %s" % e)
+                    self._running = False
+                    break
+                continue
+
+            last_fbur = time.time()
+
+            try:
+                with self._sock_write_lock:
+                    self.send_rectangles(self.socket, x, y, w, h, incremental)
+                    if self.cursor_support:
+                        self.send_cursor(x, y)
+            except Exception as e:
+                log.debug("FB sender error: %s" % e)
+                self._running = False
+                break
+
+            # Adaptive rate-limit adjustment
+            sent_bytes = getattr(self, '_last_sent_bytes', 0)
+            self._bw_estimator.record_send(sent_bytes)
+            bps = self._bw_estimator.current_bps
+            if bps > 0 and sent_bytes > 0:
+                frame_budget = (bps * self.fbupdate_rate_limit) / 8
+                ratio = sent_bytes / max(frame_budget, 1)
+                if ratio < 0.5:
+                    self.fbupdate_rate_limit = max(
+                        self.fbupdate_min_interval,
+                        self.fbupdate_rate_limit * 0.9
+                    )
+                elif ratio > 1.5:
+                    self.fbupdate_rate_limit = min(
+                        self.fbupdate_max_interval,
+                        self.fbupdate_rate_limit * 1.1
+                    )
 
     def get_rectangle(self, x, y, w, h):
         try:
@@ -586,6 +591,32 @@ class VNCServer():
         
         return crop
 
+    def _encode_cursor_pixels(self, rgb_image):
+        """Convert a PIL RGB image to wire-format pixel bytes that match the
+        current framebuffer pixel format (same packing as the raw encoding).
+        """
+        bpp_bytes = self.bpp // 8
+        arr = np.asarray(rgb_image)
+        if arr.ndim == 2:
+            arr = arr.reshape(arr.shape[0], arr.shape[1], 1)
+        h, w = arr.shape[:2]
+
+        if bpp_bytes == 4:
+            out = np.zeros((h, w, 4), dtype=np.uint8)
+            out[:, :, :3] = arr[:, :, :3]
+            return out.tobytes()
+        elif bpp_bytes == 2:
+            r = arr[:, :, 0].astype(np.uint16)
+            g = arr[:, :, 1].astype(np.uint16)
+            b = arr[:, :, 2].astype(np.uint16)
+            val = ((b >> 3) << 11) | ((g >> 2) << 5) | (r >> 3)
+            out = np.zeros((h, w, 2), dtype=np.uint8)
+            out[:, :, 0] = val & 0xFF
+            out[:, :, 1] = (val >> 8) & 0xFF
+            return out.tobytes()
+        else:
+            return arr.tobytes()
+
     def send_cursor(self, x, y):
         cursor_img = self.cursor_encoding.get_cursor_image()
         if cursor_img is None:
@@ -593,35 +624,42 @@ class VNCServer():
 
         if self.last_cursor == cursor_img:
             return True
-        
-        w, h = cursor_img.size
-        bitmap = self.rfb_bitmap
-        self.last_cursor = cursor_img
-        raw_pixels = bitmap.get_bitmap(cursor_img)
-        raw_pixels = raw_pixels.tobytes("raw", raw_pixels.mode)
 
-        # Create bitmask
+        w, h = cursor_img.size
+        self.last_cursor = cursor_img
+
+        # Ensure RGBA so we can extract the alpha mask
+        if cursor_img.mode != "RGBA":
+            cursor_img = cursor_img.convert("RGBA")
+
+        # Convert to the framebuffer pixel format (correct bytes-per-pixel)
+        bitmap = self.rfb_bitmap
+        rgb = bitmap.get_bitmap(cursor_img)
+        raw_pixels = self._encode_cursor_pixels(rgb)
+
+        # Build transparency bitmask (1 = opaque, MSB first per row)
         bitmask = bytearray()
+        row_bytes = (w + 7) // 8
         for j in range(h):
             row = 0
             for i in range(w):
-                if cursor_img.getpixel((i, j))[3]:  # Verify alpha pixel
+                if cursor_img.getpixel((i, j))[3]:
                     row |= (128 >> (i % 8))
                 if (i % 8 == 7) or i == w - 1:
                     bitmask.append(row)
                     row = 0
 
         sendbuff = bytearray()
-        sendbuff.extend(pack("!BxH", 0, 1))  # FramebufferUpdate, 1 rectangle
-        sendbuff.extend(pack("!HHHH", x, y, w, h))  # geometry
-        sendbuff.extend(pack("!i", -239))  # cursor pseudo encoding
+        sendbuff.extend(pack("!BxH", 0, 1))       # FramebufferUpdate, 1 rect
+        sendbuff.extend(pack("!HHHH", 0, 0, w, h)) # hotspot (0,0), cursor size
+        sendbuff.extend(pack("!i", -239))           # cursor pseudo-encoding
         sendbuff.extend(raw_pixels)
         sendbuff.extend(bitmask)
 
         try:
             self.socket.sendall(sendbuff)
         except Exception as e:
-            print(f"Error sending cursor info: {e}")
+            log.debug("Error sending cursor info: %s" % e)
             return False
 
         return True
@@ -629,9 +667,18 @@ class VNCServer():
 
     def send_rectangles(self, sock, x, y, w, h, incremental=0):
         # send FramebufferUpdate to client
+
+        # Guard against zero-dimension requests
+        if w <= 0 or h <= 0:
+            try:
+                sock.sendall(pack("!BxH", 0, 0))
+            except Exception:
+                return False
+            return
+
         rectangle = self.get_rectangle(x, y, w, h)
         if not rectangle:
-            log.debug(f"send_rectangles: get_rectangle returned falsy for ({x},{y},{w},{h})")
+            log.debug("send_rectangles: get_rectangle returned falsy for (%d,%d,%d,%d)" % (x, y, w, h))
             rectangle = Image.new("RGB", [w, h], (0,0,0))
 
         lastshot = rectangle
@@ -686,25 +733,14 @@ class VNCServer():
 
         self.framebuffer = lastshot
 
-        # Chunked send with input draining to keep keyboard/mouse responsive
+        # Send the entire framebuffer update in one shot.  The socket is in
+        # blocking mode (settimeout(None)), so sendall blocks until the OS
+        # has accepted all bytes — which is exactly what we want here.
         try:
-            sent = 0
-            total = len(sendbuff)
-            CHUNK = 65536
-            while sent < total:
-                chunk = sendbuff[sent:sent + CHUNK]
-                n = sock.send(chunk)
-                sent += n
-                # Drain any pending input that arrived while we were sending
-                try:
-                    peek = sock.recv(4096)
-                    if peek:
-                        self._process_pending_input(sock, peek, self._mouse_controller, self._kbd_controller, self._clipboard_controller)
-                except (BlockingIOError, OSError):
-                    pass
-            log.debug(f"send_rectangles: sent {sent} bytes for ({x},{y},{w},{h})")
+            sock.sendall(sendbuff)
+            log.debug("send_rectangles: sent %d bytes for (%d,%d,%d,%d)" % (len(sendbuff), x, y, w, h))
         except Exception as e:
-            log.debug(f"Error sending changes: {str(e)}")
+            log.debug("Error sending changes: %s" % e)
             return False
 
         self._last_sent_bytes = len(sendbuff)
